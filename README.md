@@ -3,10 +3,15 @@
 Beignet is a toy distributed harness for me to play around with distributed systems some more,
 dig into pi's internals, and keep my long tasks running when my PC force-restarts overnight (ty microslop).
 
-core files/dirs:
-|-> main.go: core distributed runtime abstraction
-|-> head/: the frontend of pi (client)
-|-> executor/: the backend of pi (tool calls, LLM calls)
+    <!-- TREEVIEW START -->
+    ```bash
+    ├── beignet/
+    │   ├── main.go
+    │   ├── head/
+    │   ├── executor/
+    ```
+    <!-- TREEVIEW END -->
+
 
 ## Development Process / AI Usage
 
