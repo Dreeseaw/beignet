@@ -1,0 +1,62 @@
+// Content-addressed blob client + step-id derivation.
+// Shared by the executor (chaining) and the head (turn start).
+import { createHash } from "node:crypto";
+
+export function sha256(data: string): string {
+	return createHash("sha256").update(data).digest("hex");
+}
+
+export function hashOf(value: unknown): string {
+	return sha256(JSON.stringify(value));
+}
+
+export function stepIdOf(kind: string, spec: unknown): string {
+	return sha256(JSON.stringify({ kind, spec }));
+}
+
+export class BlobClient {
+	sidecar: string;
+
+	constructor(sidecar: string) {
+		this.sidecar = sidecar;
+	}
+
+	async get(hash: string): Promise<string> {
+		const res = await fetch(`${this.sidecar}/v1/blob/${hash}`);
+		if (!res.ok) throw new Error(`blob ${hash.slice(0, 12)}… unavailable (HTTP ${res.status})`);
+		return await res.text();
+	}
+
+	async getJson(hash: string): Promise<any> {
+		return JSON.parse(await this.get(hash));
+	}
+
+	/** Upload only what the cluster lacks. Returns nothing; hashes are derivable. */
+	async putMissing(blobs: Map<string, unknown>): Promise<void> {
+		if (blobs.size === 0) return;
+		const res = await fetch(`${this.sidecar}/v1/blobs/missing`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ hashes: [...blobs.keys()] }),
+		});
+		if (!res.ok) throw new Error(`blobs/missing HTTP ${res.status}`);
+		const { missing } = (await res.json()) as { missing: string[] };
+		await Promise.all(missing.map((hash) => this.putOne(hash, blobs.get(hash))));
+	}
+
+	/** Store one value, return its hash. Blobs must land before any step referencing them. */
+	async put(value: unknown): Promise<string> {
+		const hash = hashOf(value);
+		await this.putOne(hash, value);
+		return hash;
+	}
+
+	private async putOne(hash: string, value: unknown): Promise<void> {
+		const res = await fetch(`${this.sidecar}/v1/blob/${hash}`, {
+			method: "PUT",
+			headers: { "content-type": "application/octet-stream" },
+			body: JSON.stringify(value),
+		});
+		if (!res.ok) throw new Error(`blob PUT ${hash.slice(0, 12)}… HTTP ${res.status}`);
+	}
+}

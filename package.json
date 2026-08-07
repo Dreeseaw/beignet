@@ -1,0 +1,17 @@
+{
+  "name": "beignet-ts",
+  "private": true,
+  "type": "module",
+  "description": "beignet TS side: executor/ (steps + turn chaining + reference sidecar) and head/ (client CLI)",
+  "scripts": {
+    "executor": "node executor/executor.ts",
+    "fakecar": "node executor/fakecar.ts",
+    "head": "node head/head.ts",
+    "test": "node --test executor/test/*.test.ts",
+    "conformance": "node executor/conformance.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0"
+  }
+}
