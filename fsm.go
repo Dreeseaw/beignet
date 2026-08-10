@@ -18,21 +18,37 @@ const applyTimeout = 5 * time.Second
 type FSM struct {
 	blobs *sync.Map
 	steps *sync.Map
+	order *sync.Map // session -> []stepID, submission order
 }
 
-// Step marshal for use as the sync.Map value
+type StepState string
+
+const (
+	StatePending StepState = "pending"
+	StateClaimed StepState = "claimed"
+	StateDone    StepState = "done"
+)
+
+// Step is the sync.Map value: one LLM call or one tool call.
 type Step struct {
-	Owner string `json:"owner"`
-	Value []byte `json:"value"`
+	ID      string          `json:"id"`
+	Session string          `json:"session"`
+	Kind    string          `json:"kind"`
+	Spec    json.RawMessage `json:"spec"`
+	State   StepState       `json:"state"`
+	Owner   string          `json:"owner,omitempty"`
+	Attempt int             `json:"attempt"`
+	Result  json.RawMessage `json:"result,omitempty"`
 }
 
 // Raft operations types
 type OpType string
 
 const (
-	OpPutBlob    OpType = "PutBlob"
-	OpSubmitStep OpType = "SubmitStep"
-	OpClaimStep  OpType = "ClaimStep"
+	OpPutBlob      OpType = "PutBlob"
+	OpSubmitStep   OpType = "SubmitStep"
+	OpClaimStep    OpType = "ClaimStep"
+	OpCommitResult OpType = "CommitResult"
 )
 
 type PutBlobOp struct {
@@ -41,13 +57,31 @@ type PutBlobOp struct {
 }
 
 type SubmitStepOp struct {
-	StepID string `json:"step_id"`
-	Value  []byte `json:"value"`
+	StepID  string          `json:"step_id"`
+	Session string          `json:"session"`
+	Kind    string          `json:"kind"`
+	Spec    json.RawMessage `json:"spec"`
 }
 
 type ClaimStepOp struct {
 	StepID string `json:"step_id"`
 	NodeID string `json:"node_id"`
+}
+
+// NextStep is the successor the executor computed. Opaque to us: we carry it.
+type NextStep struct {
+	StepID  string          `json:"step_id"`
+	Session string          `json:"session"`
+	Kind    string          `json:"kind"`
+	Spec    json.RawMessage `json:"spec"`
+}
+
+type CommitResultOp struct {
+	StepID  string          `json:"step_id"`
+	NodeID  string          `json:"node_id"`
+	Attempt int             `json:"attempt"`
+	Result  json.RawMessage `json:"result"`
+	Next    *NextStep       `json:"next,omitempty"`
 }
 
 type Payload struct {
@@ -58,8 +92,37 @@ type Payload struct {
 // ClaimVerdict rides back to the proposer via fut.Response().
 // A rejected claim is a normal answer, not an error.
 type ClaimVerdict struct {
-	Won    bool   `json:"won"`
-	Reason string `json:"reason,omitempty"`
+	Won     bool   `json:"won"`
+	Attempt int    `json:"attempt"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+type CommitVerdict struct {
+	Committed bool   `json:"committed"`
+	Reason    string `json:"reason,omitempty"` // duplicate | fenced | unknown step
+}
+
+// appendOrder records submission order per session.
+// Copies on append so concurrent readers always hold an immutable snapshot.
+func (fsm *FSM) appendOrder(session, stepID string) {
+	var ids []string
+	if v, ok := fsm.order.Load(session); ok {
+		old := v.([]string)
+		ids = make([]string, len(old), len(old)+1)
+		copy(ids, old)
+	}
+	fsm.order.Store(session, append(ids, stepID))
+}
+
+// insertStep adds a Pending step if the id is new. Reports whether it inserted.
+func (fsm *FSM) insertStep(id, session, kind string, spec json.RawMessage) bool {
+	if _, loaded := fsm.steps.LoadOrStore(id, Step{
+		ID: id, Session: session, Kind: kind, Spec: spec, State: StatePending,
+	}); loaded {
+		return false // dedup
+	}
+	fsm.appendOrder(session, id)
+	return true
 }
 
 // encodeOp wraps a typed op in the envelope CoreApply decodes.
@@ -104,8 +167,7 @@ func (fsm *FSM) CoreApply(p *Payload) any {
 		if err := json.Unmarshal(p.Data, &op); err != nil {
 			return fmt.Errorf("invalid SubmitStep data: %w", err)
 		}
-		// dedup: submitting a known id is a no-op
-		fsm.steps.LoadOrStore(op.StepID, Step{Value: op.Value})
+		fsm.insertStep(op.StepID, op.Session, op.Kind, op.Spec)
 
 		// after each node stores the new step, launch the async job on the worker channel
 		// for the node itself to broadcast a ClaimStep op for execution
@@ -118,15 +180,46 @@ func (fsm *FSM) CoreApply(p *Payload) any {
 		}
 		v, found := fsm.steps.Load(op.StepID)
 		if !found {
-			return ClaimVerdict{Won: false, Reason: "unknown step"}
+			return ClaimVerdict{Reason: "unknown step"}
 		}
 		step := v.(Step)
-		if step.Owner != "" && step.Owner != op.NodeID {
-			return ClaimVerdict{Won: false, Reason: "owned by " + step.Owner}
+		if step.State == StateDone {
+			return ClaimVerdict{Reason: "already done"}
 		}
+		if step.Owner != "" && step.Owner != op.NodeID {
+			return ClaimVerdict{Reason: "owned by " + step.Owner}
+		}
+		step.State = StateClaimed
 		step.Owner = op.NodeID // CAS through consensus; re-claim by owner is idempotent
 		fsm.steps.Store(op.StepID, step)
-		return ClaimVerdict{Won: true}
+		return ClaimVerdict{Won: true, Attempt: step.Attempt}
+
+	case OpCommitResult:
+		var op CommitResultOp
+		if err := json.Unmarshal(p.Data, &op); err != nil {
+			return fmt.Errorf("invalid CommitResult data: %w", err)
+		}
+		v, found := fsm.steps.Load(op.StepID)
+		if !found {
+			return CommitVerdict{Reason: "unknown step"}
+		}
+		step := v.(Step)
+		if step.State == StateDone {
+			return CommitVerdict{Reason: "duplicate"}
+		}
+		if step.Owner != op.NodeID || step.Attempt != op.Attempt {
+			return CommitVerdict{Reason: "fenced"} // a zombie's late result
+		}
+		step.State = StateDone
+		step.Result = op.Result
+		fsm.steps.Store(op.StepID, step)
+
+		// ATOMIC with the commit: the successor enters the ledger in this same
+		// Apply, so no crash can strand a turn between "done" and "chained".
+		if op.Next != nil {
+			fsm.insertStep(op.Next.StepID, op.Next.Session, op.Next.Kind, op.Next.Spec)
+		}
+		return CommitVerdict{Committed: true}
 
 	default:
 		return fmt.Errorf("unknown internal raft command: %s", p.Type)
