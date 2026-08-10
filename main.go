@@ -17,10 +17,12 @@ import (
 
 // Core objects
 type HTTPServer struct {
-	raft   *raft.Raft
-	blobs  *sync.Map
-	steps  *sync.Map
-	nodeID string
+	raft     *raft.Raft
+	blobs    *sync.Map
+	steps    *sync.Map
+	order    *sync.Map
+	nodeID   string
+	execAddr string
 }
 
 func main() {
@@ -28,7 +30,7 @@ func main() {
 	// Setup command-line options
 	nodeID := flag.String("id", "node1", "Unique node identifier")
 	httpAddr := flag.String("http", "127.0.0.1:4700", "HTTP server address")
-	// execAddr := flag.String("executor", "127.0.0.1:4701", "Local executor address")
+	execAddr := flag.String("executor", "http://127.0.0.1:4701", "Local executor base URL")
 	raftAddr := flag.String("raft", "127.0.0.1:7000", "Raft comms address")
 	joinAddr := flag.String("join", "", "HTTP address of the existing leader to join (leave blank for node1)")
 	flag.Parse()
@@ -36,7 +38,8 @@ func main() {
 	// Make service objects
 	blobs := &sync.Map{}
 	steps := &sync.Map{}
-	fsm := &FSM{blobs: blobs, steps: steps}
+	order := &sync.Map{}
+	fsm := &FSM{blobs: blobs, steps: steps, order: order}
 
 	// Raft Configurations
 	config := raft.DefaultConfig()
@@ -91,16 +94,29 @@ func main() {
 	}
 
 	// Start HTTP Server
-	srv := &HTTPServer{raft: r, blobs: blobs, steps: steps, nodeID: *nodeID}
+	srv := &HTTPServer{
+		raft:     r,
+		blobs:    blobs,
+		steps:    steps,
+		order:    order,
+		nodeID:   *nodeID,
+		execAddr: *execAddr,
+	}
 	http.HandleFunc("GET /join", srv.joinHandler)
 	http.HandleFunc("GET /healthz", srv.healthzHandler)
-	
+
 	http.HandleFunc("POST /v1/step", srv.stepHandler)
 
 	// Blob storage interface
 	http.HandleFunc("GET /v1/blob/{hash}", srv.hashGetHandler)
 	http.HandleFunc("PUT /v1/blob/{hash}", srv.hashSetHandler)
-	// http.HandleFunc("POST /v1/blob/missing", srv.hashMissingHandler)
+	http.HandleFunc("POST /v1/blobs/missing", srv.hashMissingHandler)
+
+	// Session watch interface
+	http.HandleFunc("GET /v1/session/{session}/steps", srv.sessionStepsHandler)
+
+	// Claim + execute loop: sweeps the replicated steps map for pending work.
+	go srv.claimLoop()
 
 	// Automatically attempt connection if a join target was passed
 	if *joinAddr != "" {

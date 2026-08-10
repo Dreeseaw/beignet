@@ -1,2 +1,3 @@
 docs/
-node-modules/
+node_modules/
+beignet
