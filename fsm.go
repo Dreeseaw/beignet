@@ -1,6 +1,20 @@
 // fsm.go
 // home of the distributed logic (the fun stuff!!)
 
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/hashicorp/raft"
+)
+
+const applyTimeout = 5 * time.Second
+
 type FSM struct {
 	blobs *sync.Map
 	steps *sync.Map
@@ -41,136 +55,109 @@ type Payload struct {
 	Data json.RawMessage `json:"data"`
 }
 
+// ClaimVerdict rides back to the proposer via fut.Response().
+// A rejected claim is a normal answer, not an error.
+type ClaimVerdict struct {
+	Won    bool   `json:"won"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// encodeOp wraps a typed op in the envelope CoreApply decodes.
+func encodeOp(t OpType, data any) ([]byte, error) {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(Payload{Type: t, Data: raw})
+}
+
+// applyOp proposes an op and returns the FSM's VERDICT, not just consensus
+// success. Followers get ErrNotLeader until M3 adds leader forwarding.
+func (h *HTTPServer) applyOp(t OpType, data any) (any, error) {
+	op, err := encodeOp(t, data)
+	if err != nil {
+		return nil, err
+	}
+	fut := h.raft.Apply(op, applyTimeout)
+	if err := fut.Error(); err != nil {
+		return nil, err
+	}
+	return fut.Response(), nil
+}
+
 // Manages core-data application logic
 // - each case is an operation, parse the JSON and do it
 // - we're inside a raft update here so be careful and NEVER BLOCK
 func (fsm *FSM) CoreApply(p *Payload) any {
-	switch p.Op {
-	case OpType.OpPutBlob:
+	switch p.Type {
+	case OpPutBlob:
 		var op PutBlobOp
 		if err := json.Unmarshal(p.Data, &op); err != nil {
 			return fmt.Errorf("invalid PutBlob data: %w", err)
 		}
 		fsm.blobs.Store(op.Key, op.Value)
-	case OpType.OpSubmitStep:
+
+	case OpSubmitStep:
 		// on raft apply, each node should trigger a worker chan to asyncly
 		// attempt to claim the step
 		var op SubmitStepOp
 		if err := json.Unmarshal(p.Data, &op); err != nil {
 			return fmt.Errorf("invalid SubmitStep data: %w", err)
 		}
-
-		// Store the newly submitted step for claiming/execution
-		stepValue := Step{
-			Owner: "",
-			Value: op.Value,
-		}
-		stepBytes, err := json.Marshal(stepValue)
-		if err != nil {
-			log.Fatalf("Error marshaling to JSON: %v", err)
-		}
-		fsm.steps.Store(op.StepID, stepBytes)
+		// dedup: submitting a known id is a no-op
+		fsm.steps.LoadOrStore(op.StepID, Step{Value: op.Value})
 
 		// after each node stores the new step, launch the async job on the worker channel
 		// for the node itself to broadcast a ClaimStep op for execution
 		// TODO: ^
 
-	case OpType.OpClaimStep:
+	case OpClaimStep:
 		var op ClaimStepOp
 		if err := json.Unmarshal(p.Data, &op); err != nil {
 			return fmt.Errorf("invalid ClaimStep data: %w", err)
 		}
-
-		stepBytes, found := fsm.steps.Load(op.StepID)
+		v, found := fsm.steps.Load(op.StepID)
 		if !found {
-			return fmt.Errorf("Could not locate step %s for claim", op.StepID)
+			return ClaimVerdict{Won: false, Reason: "unknown step"}
 		}
-		
-		// parse Owner from a JSON blob (keys=owner,value)
-		var stepValue Step
-		if err := json.Unmarshal(stepBytes, &stepValue); err != nil {
-			return fmt.Errorf("invalid stored step data: %w", err)
+		step := v.(Step)
+		if step.Owner != "" && step.Owner != op.NodeID {
+			return ClaimVerdict{Won: false, Reason: "owned by " + step.Owner}
 		}
-		if stepValue.Owner == "" {
-			// winner winner (overwrite entry)
-			newStepValue := Step{
-				Owner: op.NodeID,
-				Value: stepValue.Value,
-			}
-			if newStepBytes, err := json.Marshal(newStepValue); err != nil {
-				return fmt.Errorf("invalid attempt to store step data: %w", err)
-			}
-			fsm.steps.Store(op.StepID, newStepBytes)
-		} 
-		
+		step.Owner = op.NodeID // CAS through consensus; re-claim by owner is idempotent
+		fsm.steps.Store(op.StepID, step)
+		return ClaimVerdict{Won: true}
+
 	default:
-		return fmt.Errorf("Unknown internal raft command: %s", p.Op)
+		return fmt.Errorf("unknown internal raft command: %s", p.Type)
 	}
 	return nil
 }
 
 // Managed raft-level application logic
-func (fsm *FSM) Apply(log *raft.Log) any {
-    switch log.Type {
-    case raft.LogCommand:
-        var p Payload
-        err := json.Unmarshal(log.Data, &p)
-        if err != nil {
-            return fmt.Errorf("Could not parse payload: %s", err)
-        }
-		fsm.CoreApply(p)	
-    default:
-        return fmt.Errorf("Unknown raft log type: %#v", log.Type)
-    }
-
-    return nil
+func (fsm *FSM) Apply(entry *raft.Log) any {
+	if entry.Type != raft.LogCommand {
+		return nil // noop/barrier/config entries aren't ours
+	}
+	var p Payload
+	if err := json.Unmarshal(entry.Data, &p); err != nil {
+		return fmt.Errorf("could not parse payload: %w", err)
+	}
+	return fsm.CoreApply(&p)
 }
 
 // Naive snapshotting implementation to begin
 type snapshot struct {
 	blobs *sync.Map
-	steps *sync.Map 
+	steps *sync.Map
 }
-func (f *FSM) Snapshot() (raft.FSMSnapshot, error) { return &snapshot{blobs: f.blobs, steps: f.steps}, nil }
-func (f *FSM) Restore(rc io.ReadCloser) error      { return nil }
-func (s *snapshot) Persist(sink raft.SnapshotSink) error { 
-	sink.Write([]byte(`{}`)); return sink.Close() 
+
+func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
+	return &snapshot{blobs: f.blobs, steps: f.steps}, nil
+}
+func (f *FSM) Restore(rc io.ReadCloser) error { return nil }
+func (s *snapshot) Persist(sink raft.SnapshotSink) error {
+	sink.Write([]byte(`{}`))
+	return sink.Close()
 }
 func (s *snapshot) Release() {}
-
-// Step Worker goroutine (async)
-// TODO: find a better home for this, but it applies a ton of distributed logic so 
-// I feel it belongs here with the rest of the dist logic
-func (h *HTTPServer) worker(id int, jobs <-chan Job) {
-	for job := range jobs {
-		fmt.Printf("[Worker %d] Started processing job %d for %s\n", id, job.ID)
-	
-		// Submit claim
-		c := Payload{Op: OpType.OpClaimStep, StepID: job.ID, NodeID: job.Worker}
-		op, _ := json.Marshal(c)
-		fut := h.raft.Apply(op, 1*time.Second)
-		if err := fut.Error(); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to write value: %s", err), http.StatusInternalServerError)
-			return
-		}
-
-		// Check step entry to see if our claim won
-		stepBytes, found := h.steps.Load(job.ID)
-		if found != nil {
-			return fmt.Errorf("Could not locate step %s for claim", op.StepID)
-		}
-
-		var s Step
-		if err := json.Unmarshal(stepBytes, &s); err != nil {
-			return fmt.Errorf("invalid stored step data: %w", err)
-		}
-		
-		// winner winner!!!
-		if s.Owner == job.NodeID {
-			res := h.execClient.run(s)
-			// TODO: apply a CommitResultOp
-		}
-
-		fmt.Printf("[Worker %d] Finished job %d\n", id, job.ID)
-	}
-}

@@ -1,15 +1,33 @@
 // api.go
 // handlers, req/resp structs, helpers
 
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+
+	"github.com/hashicorp/raft"
+)
+
+func writeErr(w http.ResponseWriter, code int, msg string) {
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
 // ------------
 // Step Handler
 // ------------
 
 type StepRequest struct {
-	StepID  string `json:"step_id"`
-	Session string `json:"session"`
-	Kind    string `json:"kind"`
-	Spec    []byte `json:"spec"`
+	StepID  string          `json:"step_id"`
+	Session string          `json:"session"`
+	Kind    string          `json:"kind"`
+	Spec    json.RawMessage `json:"spec"` // an object, not base64 bytes
 }
 
 type StepResponse struct {
@@ -33,14 +51,8 @@ func (h *HTTPServer) stepHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Put SubmitStep{step_id} on ledger
-	c := Payload{Op: OpType.OpSubmitStep, Key: sr.StepID, Value: sr.Spec}
-	op, _ := json.Marshal(c)
-	fut := h.raft.Apply(op, 1*time.Second)
-
-	if err := fut.Error(); err != nil {
-		response.Error = json.RawMessage("{\"error\": \"Apply failed\"}")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(response) 
+	if _, err := h.applyOp(OpSubmitStep, SubmitStepOp{StepID: sr.StepID, Value: sr.Spec}); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 
@@ -61,7 +73,7 @@ func (h *HTTPServer) hashGetHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	hashID := r.PathValue("hash")
 
-	val, found := h.db.Load(hashID)
+	val, found := h.blobs.Load(hashID)
 	if !found {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -94,11 +106,8 @@ func (h *HTTPServer) hashSetHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Apply to FSM
-	c := Payload{Op: OpType.OpPutBlob, Key: hashID, Value: bodyBytes}
-	op, _ := json.Marshal(c)
-	fut := h.raft.Apply(op, 1*time.Second)
-	if err := fut.Error(); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to write value: %s", err), http.StatusInternalServerError)
+	if _, err := h.applyOp(OpPutBlob, PutBlobOp{Key: hashID, Value: bodyBytes}); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 

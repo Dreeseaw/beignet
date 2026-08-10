@@ -1,29 +1,26 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"flag"
 	"fmt"
-    "io"
-    "log"
-    "net"
-    "net/http"
-    "os"
+	"log"
+	"net"
+	"net/http"
+	"os"
 	"path"
-    "sync"
-    "time"
+	"sync"
+	"time"
 
-    "github.com/hashicorp/raft"
-    "github.com/hashicorp/raft-boltdb"
+	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb"
 )
 
 // Core objects
 type HTTPServer struct {
-	raft  *raft.Raft
-	blobs *sync.Map
-	steps *sync.Map
+	raft   *raft.Raft
+	blobs  *sync.Map
+	steps  *sync.Map
+	nodeID string
 }
 
 func main() {
@@ -94,7 +91,7 @@ func main() {
 	}
 
 	// Start HTTP Server
-	srv := &HTTPServer{raft: r, blobs: blobs, steps: steps}
+	srv := &HTTPServer{raft: r, blobs: blobs, steps: steps, nodeID: *nodeID}
 	http.HandleFunc("GET /join", srv.joinHandler)
 	http.HandleFunc("GET /healthz", srv.healthzHandler)
 	
