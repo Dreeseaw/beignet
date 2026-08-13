@@ -8,18 +8,30 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"time"
 
 	"github.com/hashicorp/raft"
 )
 
-const applyTimeout = 5 * time.Second
-
+// The whole ledger: two maps and two counters.
+//
+//	blobs — content-addressed bytes, no lifecycle
+//	steps — little state machines that claim, commit and expire themselves
+//	tick  — ledger time (NEVER a wall clock: advances only via Tick entries,
+//	        so every replica computes lease expiry identically and clock skew
+//	        between machines is a non-issue)
+//	seq   — insertion order; a session is just a filter over steps by Seq
 type FSM struct {
 	blobs *sync.Map
 	steps *sync.Map
-	order *sync.Map // session -> []stepID, submission order
+	nodes *sync.Map // nodeID -> HTTP address; cluster metadata, for forwarding
+	tick  uint64
+	seq   uint64
 }
+
+// A claim goes stale after this many ticks (1 tick/sec), at which point the
+// step returns to Pending for anyone to re-run. Workers renew while executing,
+// so this bounds recovery time after a node dies, not step duration.
+const leaseTicks = 30
 
 type StepState string
 
@@ -31,14 +43,54 @@ const (
 
 // Step is the sync.Map value: one LLM call or one tool call.
 type Step struct {
-	ID      string          `json:"id"`
-	Session string          `json:"session"`
-	Kind    string          `json:"kind"`
-	Spec    json.RawMessage `json:"spec"`
-	State   StepState       `json:"state"`
-	Owner   string          `json:"owner,omitempty"`
-	Attempt int             `json:"attempt"`
-	Result  json.RawMessage `json:"result,omitempty"`
+	ID        string          `json:"id"`
+	Session   string          `json:"session"`
+	Kind      string          `json:"kind"`
+	Spec      json.RawMessage `json:"spec"`
+	State     StepState       `json:"state"`
+	Owner     string          `json:"owner,omitempty"`
+	ClaimTick uint64          `json:"claim_tick,omitempty"`
+	Attempt   int             `json:"attempt"`
+	Seq       uint64          `json:"seq"`
+	Result    json.RawMessage `json:"result,omitempty"`
+}
+
+// A step owns its own lifecycle. These three rules are the entire distributed
+// contract, and they're pure functions on a value — no map, no raft, no FSM.
+
+// claim takes ownership if the step is free or already ours. Idempotent for
+// the owner, so a retry and a lease renewal are the same operation.
+func (s *Step) claim(node string, tick uint64) bool {
+	if s.Owner != "" && s.Owner != node {
+		return false
+	}
+	s.State = StateClaimed
+	s.Owner = node
+	s.ClaimTick = tick
+	return true
+}
+
+// commit stores the result only if the caller still owns THIS attempt.
+// A zombie whose lease expired fails here — that's the fence.
+func (s *Step) commit(node string, attempt int, result json.RawMessage) bool {
+	if s.Owner != node || s.Attempt != attempt {
+		return false
+	}
+	s.State = StateDone
+	s.Result = result
+	return true
+}
+
+// expired reports a stale claim; release returns it to the pool and bumps
+// Attempt so the presumed-dead owner can never commit it.
+func (s *Step) expired(tick uint64) bool {
+	return s.State == StateClaimed && tick-s.ClaimTick > leaseTicks
+}
+
+func (s *Step) release() {
+	s.State = StatePending
+	s.Owner = ""
+	s.Attempt++
 }
 
 // Raft operations types
@@ -49,7 +101,15 @@ const (
 	OpSubmitStep   OpType = "SubmitStep"
 	OpClaimStep    OpType = "ClaimStep"
 	OpCommitResult OpType = "CommitResult"
+	OpTick         OpType = "Tick"
+	OpSetNode      OpType = "SetNode"
 )
+
+// SetNodeOp publishes a node's HTTP address so followers can forward writes.
+type SetNodeOp struct {
+	NodeID   string `json:"node_id"`
+	HTTPAddr string `json:"http_addr"`
+}
 
 type PutBlobOp struct {
 	Key   string `json:"key"`
@@ -102,26 +162,17 @@ type CommitVerdict struct {
 	Reason    string `json:"reason,omitempty"` // duplicate | fenced | unknown step
 }
 
-// appendOrder records submission order per session.
-// Copies on append so concurrent readers always hold an immutable snapshot.
-func (fsm *FSM) appendOrder(session, stepID string) {
-	var ids []string
-	if v, ok := fsm.order.Load(session); ok {
-		old := v.([]string)
-		ids = make([]string, len(old), len(old)+1)
-		copy(ids, old)
-	}
-	fsm.order.Store(session, append(ids, stepID))
-}
-
 // insertStep adds a Pending step if the id is new. Reports whether it inserted.
+// The only place steps are created, so Seq can't drift.
 func (fsm *FSM) insertStep(id, session, kind string, spec json.RawMessage) bool {
-	if _, loaded := fsm.steps.LoadOrStore(id, Step{
-		ID: id, Session: session, Kind: kind, Spec: spec, State: StatePending,
-	}); loaded {
+	if _, exists := fsm.steps.Load(id); exists {
 		return false // dedup
 	}
-	fsm.appendOrder(session, id)
+	fsm.seq++
+	fsm.steps.Store(id, Step{
+		ID: id, Session: session, Kind: kind, Spec: spec,
+		State: StatePending, Seq: fsm.seq,
+	})
 	return true
 }
 
@@ -132,20 +183,6 @@ func encodeOp(t OpType, data any) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(Payload{Type: t, Data: raw})
-}
-
-// applyOp proposes an op and returns the FSM's VERDICT, not just consensus
-// success. Followers get ErrNotLeader until M3 adds leader forwarding.
-func (h *HTTPServer) applyOp(t OpType, data any) (any, error) {
-	op, err := encodeOp(t, data)
-	if err != nil {
-		return nil, err
-	}
-	fut := h.raft.Apply(op, applyTimeout)
-	if err := fut.Error(); err != nil {
-		return nil, err
-	}
-	return fut.Response(), nil
 }
 
 // Manages core-data application logic
@@ -186,11 +223,9 @@ func (fsm *FSM) CoreApply(p *Payload) any {
 		if step.State == StateDone {
 			return ClaimVerdict{Reason: "already done"}
 		}
-		if step.Owner != "" && step.Owner != op.NodeID {
+		if !step.claim(op.NodeID, fsm.tick) { // CAS through consensus
 			return ClaimVerdict{Reason: "owned by " + step.Owner}
 		}
-		step.State = StateClaimed
-		step.Owner = op.NodeID // CAS through consensus; re-claim by owner is idempotent
 		fsm.steps.Store(op.StepID, step)
 		return ClaimVerdict{Won: true, Attempt: step.Attempt}
 
@@ -207,11 +242,9 @@ func (fsm *FSM) CoreApply(p *Payload) any {
 		if step.State == StateDone {
 			return CommitVerdict{Reason: "duplicate"}
 		}
-		if step.Owner != op.NodeID || step.Attempt != op.Attempt {
+		if !step.commit(op.NodeID, op.Attempt, op.Result) {
 			return CommitVerdict{Reason: "fenced"} // a zombie's late result
 		}
-		step.State = StateDone
-		step.Result = op.Result
 		fsm.steps.Store(op.StepID, step)
 
 		// ATOMIC with the commit: the successor enters the ledger in this same
@@ -220,6 +253,26 @@ func (fsm *FSM) CoreApply(p *Payload) any {
 			fsm.insertStep(op.Next.StepID, op.Next.Session, op.Next.Kind, op.Next.Spec)
 		}
 		return CommitVerdict{Committed: true}
+
+	case OpSetNode:
+		var op SetNodeOp
+		if err := json.Unmarshal(p.Data, &op); err != nil {
+			return fmt.Errorf("invalid SetNode data: %w", err)
+		}
+		fsm.nodes.Store(op.NodeID, op.HTTPAddr)
+
+	case OpTick:
+		// Ledger time. Expiring a claim here is what makes a dead node's work
+		// recoverable: the step goes back to Pending and Attempt++ fences the
+		// zombie's late CommitResult.
+		fsm.tick++
+		fsm.steps.Range(func(_, v any) bool {
+			if step := v.(Step); step.expired(fsm.tick) {
+				step.release()
+				fsm.steps.Store(step.ID, step)
+			}
+			return true
+		})
 
 	default:
 		return fmt.Errorf("unknown internal raft command: %s", p.Type)

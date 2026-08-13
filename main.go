@@ -20,8 +20,10 @@ type HTTPServer struct {
 	raft     *raft.Raft
 	blobs    *sync.Map
 	steps    *sync.Map
-	order    *sync.Map
+	nodes    *sync.Map
+	execErr  *sync.Map // node-local: stepID -> last executor failure (not replicated)
 	nodeID   string
+	httpAddr string
 	execAddr string
 }
 
@@ -38,8 +40,8 @@ func main() {
 	// Make service objects
 	blobs := &sync.Map{}
 	steps := &sync.Map{}
-	order := &sync.Map{}
-	fsm := &FSM{blobs: blobs, steps: steps, order: order}
+	nodes := &sync.Map{}
+	fsm := &FSM{blobs: blobs, steps: steps, nodes: nodes}
 
 	// Raft Configurations
 	config := raft.DefaultConfig()
@@ -98,8 +100,10 @@ func main() {
 		raft:     r,
 		blobs:    blobs,
 		steps:    steps,
-		order:    order,
+		nodes:    nodes,
+		execErr:  &sync.Map{},
 		nodeID:   *nodeID,
+		httpAddr: *httpAddr,
 		execAddr: *execAddr,
 	}
 	http.HandleFunc("GET /join", srv.joinHandler)
@@ -115,15 +119,21 @@ func main() {
 	// Session watch interface
 	http.HandleFunc("GET /v1/session/{session}/steps", srv.sessionStepsHandler)
 
+	// Node-to-node: followers forward writes here
+	http.HandleFunc("POST /v1/internal/apply", srv.internalApplyHandler)
+
 	// Claim + execute loop: sweeps the replicated steps map for pending work.
 	go srv.claimLoop()
+	go srv.tickLoop()
+	go srv.registerSelf()
 
 	// Automatically attempt connection if a join target was passed
 	if *joinAddr != "" {
 		go func() {
 			// Small pause to allow local Raft transport initialization
 			time.Sleep(1 * time.Second)
-			joinURL := fmt.Sprintf("http://%s/join?id=%s&addr=%s", *joinAddr, *nodeID, *raftAddr)
+			joinURL := fmt.Sprintf("http://%s/join?id=%s&addr=%s&http=%s",
+				*joinAddr, *nodeID, *raftAddr, *httpAddr)
 			log.Printf("Attempting to join cluster via: %s", joinURL)
 			resp, err := http.Get(joinURL)
 			if err != nil || resp.StatusCode != http.StatusOK {
