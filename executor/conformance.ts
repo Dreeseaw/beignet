@@ -25,6 +25,15 @@ async function request(method: string, path: string, body?: unknown, contentType
 	return { status: res.status, text, json };
 }
 
+async function requestBytes(method: string, path: string, body?: Uint8Array) {
+	const res = await fetch(`${SIDECAR}${path}`, {
+		method,
+		headers: body === undefined ? undefined : { "content-type": "application/octet-stream" },
+		body,
+	});
+	return { status: res.status, bytes: new Uint8Array(await res.arrayBuffer()) };
+}
+
 const post = (path: string, body: unknown) => request("POST", path, body);
 
 try {
@@ -36,24 +45,26 @@ try {
 }
 
 // Immutable artifact contract.
-const artifact = JSON.stringify({ run, value: 42 });
+const artifact = Uint8Array.from([0x00, 0xff, 0x80, 0x41]);
 const hash = createHash("sha256").update(artifact).digest("hex");
 const missingHash = createHash("sha256").update(`${run}-missing`).digest("hex");
 {
 	const missing = await request("GET", `/v1/blob/${missingHash}`);
 	check("unknown artifact is 404", missing.status === 404, `HTTP ${missing.status}`);
 
-	const wrong = await request("PUT", `/v1/blob/${missingHash}`, artifact, "application/octet-stream");
+	const wrong = await requestBytes("PUT", `/v1/blob/${missingHash}`, artifact);
 	check("artifact hash mismatch is rejected", wrong.status === 400, `HTTP ${wrong.status}`);
 
-	const put = await request("PUT", `/v1/blob/${hash}`, artifact, "application/octet-stream");
-	const repeat = await request("PUT", `/v1/blob/${hash}`, artifact, "application/octet-stream");
+	const put = await requestBytes("PUT", `/v1/blob/${hash}`, artifact);
+	const repeat = await requestBytes("PUT", `/v1/blob/${hash}`, artifact);
 	check("artifact PUT succeeds", put.status === 200, `HTTP ${put.status}`);
 	check("artifact PUT is idempotent", repeat.status === 200, `HTTP ${repeat.status}`);
 
-	const get = await request("GET", `/v1/blob/${hash}`);
-	check("artifact GET returns exact bytes", get.status === 200 && get.text === artifact,
-		`HTTP ${get.status}: ${get.text.slice(0, 100)}`);
+	const get = await requestBytes("GET", `/v1/blob/${hash}`);
+	check("artifact GET returns exact bytes",
+		get.status === 200 && get.bytes.length === artifact.length &&
+		get.bytes.every((byte, index) => byte === artifact[index]),
+		`HTTP ${get.status}: ${Array.from(get.bytes).join(",")}`);
 
 	const batch = await post("/v1/blobs/missing", { hashes: [hash, missingHash] });
 	check("artifact missing check returns only absent hashes",
@@ -74,8 +85,9 @@ const missingHash = createHash("sha256").update(`${run}-missing`).digest("hex");
 }
 
 // Claim, renew, fence, atomic successor insertion, and requirement inheritance.
-const firstID = `${run}-first`;
-const nextID = `${run}-next`;
+const firstID = `${run}-z-first`;
+const nextID = `${run}-a-next`;
+const competingID = `${run}-competing`;
 const first = {
 	step_id: firstID,
 	session: run,
@@ -101,6 +113,15 @@ let claim: any;
 	check("claim preserves opaque spec and requirements",
 		JSON.stringify(claim?.spec) === JSON.stringify(first.spec) && claim?.requirements?.pool === "gpu");
 
+	const queued = await post("/v1/step?wait=false", {
+		step_id: competingID,
+		session: `${run}-competition`,
+		kind: "tool",
+		spec: { tool: "bash", args: { command: "echo competing" }, cwd: "/tmp" },
+		requirements: { pool: "gpu", zone: "test" },
+	});
+	check("competing eligible work is queued", queued.status === 202, `HTTP ${queued.status}: ${queued.text}`);
+
 	const retry = await post("/v1/work/claim", claimRequest);
 	check("ambiguous claim retry returns the same attempt",
 		retry.status === 200 && retry.json?.step_id === firstID && retry.json?.attempt === claim.attempt,
@@ -123,6 +144,13 @@ let claim: any;
 	});
 	check("non-owner commit is fenced", staleCommit.status === 409 && staleCommit.json?.committed === false,
 		`HTTP ${staleCommit.status}: ${staleCommit.text}`);
+	const wrongAttemptCommit = await post("/v1/work/commit", {
+		worker_id: "worker-a", step_id: firstID, attempt: claim.attempt + 1,
+		result: { value: "wrong attempt" },
+	});
+	check("same-owner wrong-attempt commit is fenced",
+		wrongAttemptCommit.status === 409 && wrongAttemptCommit.json?.committed === false,
+		`HTTP ${wrongAttemptCommit.status}: ${wrongAttemptCommit.text}`);
 
 	const commit = await post("/v1/work/commit", {
 		worker_id: "worker-a",
