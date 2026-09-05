@@ -26,6 +26,7 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
       - run: npm test
+      - run: npm run docs:build
 
   seaweedfs:
     runs-on: ubuntu-24.04

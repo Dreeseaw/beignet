@@ -1,4 +1,9 @@
-docs/
-node_modules/
-beignet
-artifact-data/
+/node_modules/
+/beignet
+/artifact-data/
+/raft-data/
+*.log
+.env
+.env.*.local
+/docs/.vitepress/cache/
+/docs/.vitepress/dist/

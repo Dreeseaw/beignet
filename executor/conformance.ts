@@ -76,6 +76,7 @@ const missingHash = createHash("sha256").update(`${run}-missing`).digest("hex");
 // Claim, renew, fence, atomic successor insertion, and requirement inheritance.
 const firstID = `${run}-first`;
 const nextID = `${run}-next`;
+const reservedNextID = `${run}-reserved-next`;
 const first = {
 	step_id: firstID,
 	session: run,
@@ -123,6 +124,33 @@ let claim: any;
 	});
 	check("non-owner commit is fenced", staleCommit.status === 409 && staleCommit.json?.committed === false,
 		`HTTP ${staleCommit.status}: ${staleCommit.text}`);
+
+	const reserve = await post("/v1/step?wait=false", {
+		step_id: reservedNextID,
+		session: `${run}-reserved`,
+		kind: "tool",
+		spec: { tool: "bash", args: { command: "true" }, cwd: "/tmp" },
+		requirements: { pool: "reserved" },
+	});
+	check("successor collision fixture is accepted", reserve.status === 202,
+		`HTTP ${reserve.status}: ${reserve.text}`);
+	const collision = await post("/v1/work/commit", {
+		worker_id: "worker-a",
+		step_id: firstID,
+		attempt: claim.attempt,
+		result: { value: "must-not-land" },
+		next: { step_id: reservedNextID, session: run, kind: "llm", spec: { model: "opaque" } },
+	});
+	check("existing successor id rejects the whole commit",
+		collision.status === 409 && collision.json?.committed === false &&
+			collision.json?.reason === "next step exists",
+		`HTTP ${collision.status}: ${collision.text}`);
+	const afterCollision = await post("/v1/work/renew", {
+		worker_id: "worker-a", step_id: firstID, attempt: claim.attempt,
+	});
+	check("rejected successor collision leaves the claim live",
+		afterCollision.status === 200 && afterCollision.json?.renewed === true,
+		`HTTP ${afterCollision.status}: ${afterCollision.text}`);
 
 	const commit = await post("/v1/work/commit", {
 		worker_id: "worker-a",

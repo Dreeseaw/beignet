@@ -187,7 +187,7 @@ type RenewVerdict struct {
 
 type CommitVerdict struct {
 	Committed bool   `json:"committed"`
-	Reason    string `json:"reason,omitempty"` // duplicate | fenced | unknown step
+	Reason    string `json:"reason,omitempty"` // duplicate | fenced | unknown step | next step exists
 }
 
 // insertStep adds a Pending step if the id is new. Reports whether it inserted.
@@ -293,6 +293,14 @@ func (fsm *FSM) coreApply(p *Payload) any {
 		}
 		if !step.commit(op.WorkerID, op.Attempt, op.Result) {
 			return CommitVerdict{Reason: "fenced"} // a zombie's late result
+		}
+		// A caller-supplied successor ID is part of the atomic contract. Reject a
+		// collision before storing the result; otherwise this step could become
+		// Done while insertStep silently preserved an unrelated existing step.
+		if op.Next != nil {
+			if _, exists := fsm.steps.Load(op.Next.StepID); exists {
+				return CommitVerdict{Reason: "next step exists"}
+			}
 		}
 		fsm.steps.Store(op.StepID, step)
 
