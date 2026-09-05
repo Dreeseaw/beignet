@@ -4,13 +4,17 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
+	"time"
 
 	"github.com/hashicorp/raft"
 )
@@ -18,6 +22,88 @@ import (
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+const applyTimeout = 5 * time.Second
+
+// applyOp proposes an op and returns the FSM's verdict (not just consensus
+// success). Followers proxy to the leader, so any node accepts writes.
+func (h *HTTPServer) applyOp(t OpType, data any) (any, error) {
+	op, err := encodeOp(t, data)
+	if err != nil {
+		return nil, err
+	}
+	if h.raft.State() == raft.Leader {
+		fut := h.raft.Apply(op, applyTimeout)
+		if err := fut.Error(); err != nil {
+			return nil, err
+		}
+		return fut.Response(), nil
+	}
+	return h.forward(t, op)
+}
+
+// forward sends an already-encoded op to the leader's HTTP API. One hop only:
+// if that node isn't the leader either, we fail rather than ping-pong.
+func (h *HTTPServer) forward(t OpType, op []byte) (any, error) {
+	_, leaderID := h.raft.LeaderWithID()
+	if leaderID == "" {
+		return nil, fmt.Errorf("no leader")
+	}
+	addr, ok := h.nodes.Load(string(leaderID))
+	if !ok {
+		return nil, fmt.Errorf("no http address known for leader %s", leaderID)
+	}
+
+	client := &http.Client{Timeout: applyTimeout + 2*time.Second}
+	resp, err := client.Post("http://"+addr.(string)+"/v1/internal/apply",
+		"application/json", bytes.NewReader(op))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("leader %s rejected: %s", leaderID, raw)
+	}
+
+	// Rebuild the typed verdict the caller expects.
+	switch t {
+	case OpClaimStep:
+		var v ClaimVerdict
+		json.Unmarshal(raw, &v)
+		return v, nil
+	case OpCommitResult:
+		var v CommitVerdict
+		json.Unmarshal(raw, &v)
+		return v, nil
+	}
+	return nil, nil
+}
+
+// POST /v1/internal/apply — node-to-node: run a forwarded op through raft.
+func (h *HTTPServer) internalApplyHandler(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+
+	if h.raft.State() != raft.Leader {
+		writeErr(w, http.StatusServiceUnavailable, "not leader")
+		return
+	}
+	op, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	fut := h.raft.Apply(op, applyTimeout)
+	if err := fut.Error(); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	json.NewEncoder(w).Encode(fut.Response())
 }
 
 // ------------
@@ -67,13 +153,45 @@ func (h *HTTPServer) stepHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Wait for CommitResult{step_id} from ledger
-	// if ?wait=true then blob for response, else just return a session_id or something
+	// Fire and forget: the cluster owns the turn from here.
+	if r.URL.Query().Get("wait") == "false" {
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"step_id": sr.StepID})
+		return
+	}
 
-	// Return to UI
-	response.Result = json.RawMessage("{\"result\": \"something\"}")
+	// Long-poll until CommitResult lands. No notifier needed: the steps map is
+	// already the truth on every node, so we just watch it.
+	step, err := h.waitForDone(r.Context(), sr.StepID)
+	if err != nil {
+		writeErr(w, http.StatusGatewayTimeout, err.Error())
+		return
+	}
+	response.Result = step.Result
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
+}
+
+const pollInterval = 25 * time.Millisecond
+
+// waitForDone blocks until the step commits, the caller goes away, or the
+// local executor reports an infra failure (which commits nothing).
+func (h *HTTPServer) waitForDone(ctx context.Context, stepID string) (Step, error) {
+	for {
+		if v, ok := h.steps.Load(stepID); ok {
+			if step := v.(Step); step.State == StateDone {
+				return step, nil
+			}
+		}
+		if v, ok := h.execErr.Load(stepID); ok {
+			return Step{}, fmt.Errorf("%v", v)
+		}
+		select {
+		case <-ctx.Done():
+			return Step{}, ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 // -------------
@@ -104,8 +222,7 @@ func (h *HTTPServer) hashSetHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Verify if they match
 	if hex.EncodeToString(bodyHash[:]) != hashID {
-		fmt.Println("Mismatch! Hash is invalid.")
-		w.WriteHeader(http.StatusNotFound)
+		writeErr(w, http.StatusBadRequest, "hash mismatch")
 		return
 	}
 
@@ -179,24 +296,26 @@ func (h *HTTPServer) sessionStepsHandler(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	out := make([]sessionStep, 0)
-	if v, found := h.order.Load(session); found {
-		ids := v.([]string)
-		for i := since; i < len(ids); i++ {
-			sv, ok := h.steps.Load(ids[i])
-			if !ok {
-				continue
-			}
-			step := sv.(Step)
-			out = append(out, sessionStep{
-				Index:  i,
-				StepID: step.ID,
-				Kind:   step.Kind,
-				State:  step.State,
-				Spec:   step.Spec,
-				Result: step.Result,
-			})
+	// A session is just a filter over steps, ordered by insertion sequence.
+	var found []Step
+	h.steps.Range(func(_, v any) bool {
+		if step := v.(Step); step.Session == session {
+			found = append(found, step)
 		}
+		return true
+	})
+	sort.Slice(found, func(i, j int) bool { return found[i].Seq < found[j].Seq })
+
+	out := make([]sessionStep, 0, len(found))
+	for i := since; i < len(found); i++ {
+		out = append(out, sessionStep{
+			Index:  i,
+			StepID: found[i].ID,
+			Kind:   found[i].Kind,
+			State:  found[i].State,
+			Spec:   found[i].Spec,
+			Result: found[i].Result,
+		})
 	}
 	json.NewEncoder(w).Encode(map[string]any{"steps": out})
 }
@@ -220,6 +339,7 @@ func (h *HTTPServer) joinHandler(w http.ResponseWriter, r *http.Request) {
 	queryParams := r.URL.Query()
 	id := queryParams.Get("id")
 	addr := queryParams.Get("addr")
+	httpAddr := queryParams.Get("http")
 
 	if id == "" || addr == "" {
 		http.Error(w, "Missing id or addr query params", http.StatusBadRequest)
@@ -230,6 +350,14 @@ func (h *HTTPServer) joinHandler(w http.ResponseWriter, r *http.Request) {
 	if err := fut.Error(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Publish the joiner's HTTP address so it can forward writes back to us.
+	if httpAddr != "" {
+		if _, err := h.applyOp(OpSetNode, SetNodeOp{NodeID: id, HTTPAddr: httpAddr}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusOK)
 }

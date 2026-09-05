@@ -65,9 +65,11 @@ echo "--- submitting one turn, then the head exits ---"
     "Use bash to write trace-42 into proof.txt, then cat it. Reply TRACE_COMPLETE." )
 
 echo
-echo "--- worker trace (node1) ---"
+echo "--- who executed what (all nodes) ---"
 sleep 8
-grep -E 'worker|claim' "$RUN/node1.log" | tail -20 || true
+for i in 1 2 3; do
+  sed -n "s/.*> claimed/node$i  claimed/p" "$RUN/node$i.log" || true
+done | sort -k4
 
 echo
 echo "--- session as seen from node3 (a different node than the head used) ---"

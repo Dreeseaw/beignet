@@ -1,0 +1,202 @@
+package main
+
+import (
+	"encoding/json"
+	"sync"
+	"testing"
+)
+
+// The FSM is just structs and maps — no raft needed to test any invariant.
+func newFSM() *FSM {
+	return &FSM{blobs: &sync.Map{}, steps: &sync.Map{}}
+}
+
+func apply(t *testing.T, fsm *FSM, typ OpType, data any) any {
+	t.Helper()
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fsm.CoreApply(&Payload{Type: typ, Data: raw})
+}
+
+func submit(t *testing.T, fsm *FSM, id, session string) {
+	t.Helper()
+	apply(t, fsm, OpSubmitStep, SubmitStepOp{
+		StepID: id, Session: session, Kind: "tool", Spec: json.RawMessage(`{"tool":"bash"}`),
+	})
+}
+
+func step(t *testing.T, fsm *FSM, id string) Step {
+	t.Helper()
+	v, ok := fsm.steps.Load(id)
+	if !ok {
+		t.Fatalf("step %s missing", id)
+	}
+	return v.(Step)
+}
+
+func TestSubmitDedups(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "s1", "sess")
+	submit(t, fsm, "s1", "sess")
+
+	if got := step(t, fsm, "s1").Seq; got != 1 {
+		t.Errorf("duplicate submit consumed a sequence number: Seq = %d, want 1", got)
+	}
+	if fsm.seq != 1 {
+		t.Errorf("fsm.seq = %d, want 1", fsm.seq)
+	}
+}
+
+func TestSeqOrdersSubmissions(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "a", "sess")
+	submit(t, fsm, "b", "other")
+	submit(t, fsm, "c", "sess")
+
+	if a, c := step(t, fsm, "a").Seq, step(t, fsm, "c").Seq; a >= c {
+		t.Errorf("Seq not monotonic across sessions: a=%d c=%d", a, c)
+	}
+}
+
+func TestClaimIsFirstWriterWins(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "s1", "sess")
+
+	first := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
+	second := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node2"}).(ClaimVerdict)
+
+	if !first.Won {
+		t.Error("first claim should win")
+	}
+	if second.Won {
+		t.Error("second claim should lose: the step is already owned")
+	}
+	if owner := step(t, fsm, "s1").Owner; owner != "node1" {
+		t.Errorf("owner = %q, want node1", owner)
+	}
+}
+
+func TestReclaimByOwnerRenewsLease(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "s1", "sess")
+	apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"})
+
+	for i := 0; i < 5; i++ {
+		apply(t, fsm, OpTick, struct{}{})
+	}
+	again := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
+
+	if !again.Won {
+		t.Fatal("owner must be able to re-claim (that's how leases renew)")
+	}
+	if got := step(t, fsm, "s1").ClaimTick; got != fsm.tick {
+		t.Errorf("ClaimTick = %d, want %d (renewal must refresh it)", got, fsm.tick)
+	}
+}
+
+func TestLeaseExpiryReleasesAndFences(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "s1", "sess")
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "dead"}).(ClaimVerdict)
+
+	for i := uint64(0); i <= leaseTicks+1; i++ {
+		apply(t, fsm, OpTick, struct{}{})
+	}
+
+	released := step(t, fsm, "s1")
+	if released.State != StatePending || released.Owner != "" {
+		t.Fatalf("expired claim not released: state=%s owner=%q", released.State, released.Owner)
+	}
+	if released.Attempt != claim.Attempt+1 {
+		t.Errorf("Attempt = %d, want %d (fencing token must advance)", released.Attempt, claim.Attempt+1)
+	}
+
+	// The presumed-dead node comes back and tries to commit its stale work.
+	zombie := apply(t, fsm, OpCommitResult, CommitResultOp{
+		StepID: "s1", NodeID: "dead", Attempt: claim.Attempt, Result: json.RawMessage(`{"stale":true}`),
+	}).(CommitVerdict)
+	if zombie.Committed {
+		t.Error("zombie commit must be fenced")
+	}
+	if zombie.Reason != "fenced" {
+		t.Errorf("reason = %q, want fenced", zombie.Reason)
+	}
+
+	// And a live node can take over.
+	retake := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "alive"}).(ClaimVerdict)
+	if !retake.Won {
+		t.Error("released step must be claimable by another node")
+	}
+}
+
+func TestCommitStoresResultAndChainsNextAtomically(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "s1", "sess")
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
+
+	verdict := apply(t, fsm, OpCommitResult, CommitResultOp{
+		StepID:  "s1",
+		NodeID:  "node1",
+		Attempt: claim.Attempt,
+		Result:  json.RawMessage(`{"content":"ok"}`),
+		Next: &NextStep{
+			StepID: "s2", Session: "sess", Kind: "llm", Spec: json.RawMessage(`{"model":"m"}`),
+		},
+	}).(CommitVerdict)
+
+	if !verdict.Committed {
+		t.Fatalf("commit rejected: %s", verdict.Reason)
+	}
+	done := step(t, fsm, "s1")
+	if done.State != StateDone || string(done.Result) != `{"content":"ok"}` {
+		t.Errorf("step not committed: state=%s result=%s", done.State, done.Result)
+	}
+	next := step(t, fsm, "s2")
+	if next.State != StatePending || next.Kind != "llm" {
+		t.Errorf("successor not inserted as pending llm: %+v", next)
+	}
+	if next.Seq <= done.Seq {
+		t.Error("successor must sort after its predecessor")
+	}
+}
+
+func TestCommitTwiceIsDuplicate(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "s1", "sess")
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
+	op := CommitResultOp{StepID: "s1", NodeID: "node1", Attempt: claim.Attempt, Result: json.RawMessage(`1`)}
+
+	apply(t, fsm, OpCommitResult, op)
+	second := apply(t, fsm, OpCommitResult, op).(CommitVerdict)
+
+	if second.Committed || second.Reason != "duplicate" {
+		t.Errorf("second commit = %+v, want duplicate", second)
+	}
+}
+
+func TestDoneStepIsNotClaimable(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "s1", "sess")
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
+	apply(t, fsm, OpCommitResult, CommitResultOp{
+		StepID: "s1", NodeID: "node1", Attempt: claim.Attempt, Result: json.RawMessage(`1`),
+	})
+
+	again := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node2"}).(ClaimVerdict)
+	if again.Won {
+		t.Error("a finished step must never be re-claimed")
+	}
+}
+
+func TestPutBlobIsIdempotent(t *testing.T) {
+	fsm := newFSM()
+	apply(t, fsm, OpPutBlob, PutBlobOp{Key: "h1", Value: []byte("hello")})
+	apply(t, fsm, OpPutBlob, PutBlobOp{Key: "h1", Value: []byte("hello")})
+
+	v, ok := fsm.blobs.Load("h1")
+	if !ok || string(v.([]byte)) != "hello" {
+		t.Errorf("blob = %v, want hello", v)
+	}
+}
