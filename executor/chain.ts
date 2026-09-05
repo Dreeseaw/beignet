@@ -82,9 +82,10 @@ export async function computeNext(
 	spec: any,
 	result: any,
 	blobs: BlobClient,
+	signal?: AbortSignal,
 ): Promise<StepRef | null> {
-	if (kind === "llm") return await nextAfterLlm(session, spec, result, blobs);
-	if (kind === "tool") return await nextAfterTool(session, spec, result, blobs);
+	if (kind === "llm") return await nextAfterLlm(session, spec, result, blobs, signal);
+	if (kind === "tool") return await nextAfterTool(session, spec, result, blobs, signal);
 	return null;
 }
 
@@ -93,10 +94,11 @@ async function nextAfterLlm(
 	spec: any,
 	assistant: any,
 	blobs: BlobClient,
+	signal?: AbortSignal,
 ): Promise<StepRef | null> {
 	const calls = toolCallsOf(assistant);
 	if (calls.length === 0) return null; // turn over: plain reply, length cap, or error
-	const assistantRef = await blobs.put(assistant);
+	const assistantRef = await blobs.put(assistant, signal);
 	const chain: ChainMeta = {
 		model: spec.model,
 		options: spec.options ?? {},
@@ -115,6 +117,7 @@ async function nextAfterTool(
 	spec: any,
 	result: any,
 	blobs: BlobClient,
+	signal?: AbortSignal,
 ): Promise<StepRef | null> {
 	const chain: ChainMeta | undefined = spec.chain;
 	if (!chain) return null; // standalone tool step (tests, manual pokes): nothing to chain
@@ -128,7 +131,7 @@ async function nextAfterTool(
 		content: isError ? [{ type: "text", text: String(result.toolError) }] : (result.content ?? []),
 		isError,
 		timestamp: Date.now(),
-	});
+	}, signal);
 	const results = [...chain.results, resultRef];
 
 	if (chain.index + 1 < chain.calls.length) {
