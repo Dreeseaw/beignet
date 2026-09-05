@@ -190,6 +190,38 @@ func TestCommitStoresResultAndChainsNextAtomically(t *testing.T) {
 	}
 }
 
+func TestCommitRejectsExistingSuccessorWithoutMutation(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "s1", "sess")
+	submit(t, fsm, "reserved", "other")
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "worker1"}).(ClaimVerdict)
+	seqBefore := fsm.seq
+
+	verdict := apply(t, fsm, OpCommitResult, CommitResultOp{
+		StepID:   "s1",
+		WorkerID: "worker1",
+		Attempt:  claim.Attempt,
+		Result:   json.RawMessage(`{"content":"must not land"}`),
+		Next: &NextStep{
+			StepID: "reserved", Session: "sess", Kind: "llm", Spec: json.RawMessage(`{"model":"m"}`),
+		},
+	}).(CommitVerdict)
+
+	if verdict.Committed || verdict.Reason != "next step exists" {
+		t.Fatalf("collision verdict = %+v, want next step exists", verdict)
+	}
+	current := step(t, fsm, "s1")
+	if current.State != StateClaimed || len(current.Result) != 0 {
+		t.Errorf("rejected commit mutated current step: state=%s result=%s", current.State, current.Result)
+	}
+	if existing := step(t, fsm, "reserved"); existing.Session != "other" {
+		t.Errorf("rejected commit replaced existing successor: %+v", existing)
+	}
+	if fsm.seq != seqBefore {
+		t.Errorf("rejected commit consumed sequence: seq=%d, want %d", fsm.seq, seqBefore)
+	}
+}
+
 func TestCommitTwiceIsDuplicate(t *testing.T) {
 	fsm := newFSM()
 	submit(t, fsm, "s1", "sess")
