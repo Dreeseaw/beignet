@@ -329,6 +329,72 @@ func (h *HTTPServer) healthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+type statusResponse struct {
+	NodeID         string `json:"node_id"`
+	State          string `json:"state"`
+	LeaderID       string `json:"leader_id,omitempty"`
+	LeaderRaftAddr string `json:"leader_raft_addr,omitempty"`
+	LeaderHTTPAddr string `json:"leader_http_addr,omitempty"`
+}
+
+func (h *HTTPServer) currentStatus() statusResponse {
+	leaderAddr, leaderID := h.raft.LeaderWithID()
+	status := statusResponse{
+		NodeID:         h.nodeID,
+		State:          h.raft.State().String(),
+		LeaderID:       string(leaderID),
+		LeaderRaftAddr: string(leaderAddr),
+	}
+	if leaderID != "" {
+		if v, ok := h.nodes.Load(string(leaderID)); ok {
+			status.LeaderHTTPAddr = v.(string)
+		}
+	}
+	return status
+}
+
+func (h *HTTPServer) verifiedLeader() bool {
+	return h.raft.State() == raft.Leader && h.raft.VerifyLeader().Error() == nil
+}
+
+func (h *HTTPServer) internalReadyHandler(w http.ResponseWriter, r *http.Request) {
+	if !h.verifiedLeader() {
+		writeErr(w, http.StatusServiceUnavailable, "not a verified leader")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// Followers need a reachable, verified leader to route writes.
+func (h *HTTPServer) readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if h.raft.State() == raft.Leader {
+		h.internalReadyHandler(w, r)
+		return
+	}
+	status := h.currentStatus()
+	if status.LeaderID == "" || status.LeaderHTTPAddr == "" {
+		writeErr(w, http.StatusServiceUnavailable, "no routable leader")
+		return
+	}
+	client := &http.Client{Timeout: applyTimeout + 2*time.Second}
+	resp, err := client.Get("http://" + status.LeaderHTTPAddr + "/v1/internal/ready")
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "leader is unreachable")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		writeErr(w, http.StatusServiceUnavailable, "leader is not ready")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *HTTPServer) statusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(h.currentStatus())
+}
+
 // Raft request-to-join handler for leader
 func (h *HTTPServer) joinHandler(w http.ResponseWriter, r *http.Request) {
 	if h.raft.State() != raft.Leader {

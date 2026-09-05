@@ -108,6 +108,8 @@ func main() {
 	}
 	http.HandleFunc("GET /join", srv.joinHandler)
 	http.HandleFunc("GET /healthz", srv.healthzHandler)
+	http.HandleFunc("GET /readyz", srv.readyzHandler)
+	http.HandleFunc("GET /v1/status", srv.statusHandler)
 
 	http.HandleFunc("POST /v1/step", srv.stepHandler)
 
@@ -121,6 +123,7 @@ func main() {
 
 	// Node-to-node: followers forward writes here
 	http.HandleFunc("POST /v1/internal/apply", srv.internalApplyHandler)
+	http.HandleFunc("GET /v1/internal/ready", srv.internalReadyHandler)
 
 	// Claim + execute loop: sweeps the replicated steps map for pending work.
 	go srv.claimLoop()
