@@ -21,7 +21,7 @@ type Step = {
 
 const steps = new Map<string, Step>();
 const order = new Map<string, string[]>(); // session -> step ids, submission order
-const blobs = new Map<string, string>();
+const blobs = new Map<string, Buffer>();
 let renewals = 0;
 
 function submit(
@@ -41,7 +41,7 @@ function submit(
 	if (!order.has(session)) order.set(session, []);
 	order.get(session)!.push(id);
 	console.error(
-		`[fakecar] ${id.slice(0, 12)} submit ${kind}${kind === "tool" ? `:${spec.tool}` : ""} (session ${session.slice(0, 8)})`,
+		`[fakecar] ${id.slice(0, 12)} submit ${kind}${kind === "tool" ? `:${spec?.tool}` : ""} (session ${session.slice(0, 8)})`,
 	);
 	return step;
 }
@@ -60,6 +60,17 @@ function labelsMatch(requirements: Record<string, string>, labels: Record<string
 	return Object.entries(requirements).every(([key, value]) => labels[key] === value);
 }
 
+function stringMap(value: any): value is Record<string, string> {
+	return value !== null && !Array.isArray(value) && typeof value === "object" &&
+		Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function validNext(next: any): boolean {
+	return next == null || (typeof next.step_id === "string" && next.step_id &&
+		typeof next.session === "string" && next.session &&
+		(next.kind === "llm" || next.kind === "tool") && next.spec !== undefined);
+}
+
 function findWork(worker: string, labels: Record<string, string>): Step | undefined {
 	let pending: Step | undefined;
 	for (const step of steps.values()) {
@@ -75,6 +86,15 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 		let data = "";
 		req.on("data", (c) => (data += c));
 		req.on("end", () => resolve(data));
+		req.on("error", reject);
+	});
+}
+
+function readBytes(req: http.IncomingMessage): Promise<Buffer> {
+	return new Promise((resolve, reject) => {
+		const chunks: Buffer[] = [];
+		req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+		req.on("end", () => resolve(Buffer.concat(chunks)));
 		req.on("error", reject);
 	});
 }
@@ -102,6 +122,7 @@ const server = http.createServer(async (req, res) => {
 		try {
 			const { worker_id, labels = {} } = JSON.parse(await readBody(req));
 			if (typeof worker_id !== "string" || !worker_id) throw new Error("missing worker_id");
+			if (!stringMap(labels)) throw new Error("labels must be a string map");
 			const step = findWork(worker_id, labels);
 			if (!step) {
 				res.writeHead(204).end();
@@ -123,6 +144,9 @@ const server = http.createServer(async (req, res) => {
 	if (req.method === "POST" && url.pathname === "/v1/work/renew") {
 		try {
 			const { worker_id, step_id, attempt } = JSON.parse(await readBody(req));
+			if (typeof worker_id !== "string" || !worker_id || typeof step_id !== "string" || !step_id) {
+				throw new Error("missing worker_id or step_id");
+			}
 			const step = steps.get(step_id);
 			const renewed = step?.state === "claimed" && step.owner === worker_id && step.attempt === attempt;
 			res.writeHead(renewed ? 200 : 409, { "content-type": "application/json" });
@@ -137,6 +161,10 @@ const server = http.createServer(async (req, res) => {
 	if (req.method === "POST" && url.pathname === "/v1/work/commit") {
 		try {
 			const { worker_id, step_id, attempt, result, next } = JSON.parse(await readBody(req));
+			if (typeof worker_id !== "string" || !worker_id || typeof step_id !== "string" || !step_id || result === undefined) {
+				throw new Error("missing worker_id, step_id or result");
+			}
+			if (!validNext(next)) throw new Error("invalid next step");
 			const step = steps.get(step_id);
 			const accepted = step?.state === "claimed" && step.owner === worker_id && step.attempt === attempt;
 			if (!accepted) {
@@ -159,7 +187,7 @@ const server = http.createServer(async (req, res) => {
 	if (blobMatch) {
 		const hash = blobMatch[1];
 		if (req.method === "PUT") {
-			const body = await readBody(req);
+			const body = await readBytes(req);
 			if (createHash("sha256").update(body).digest("hex") !== hash) {
 				res.writeHead(400, { "content-type": "application/json" });
 				res.end(JSON.stringify({ error: "hash mismatch" }));
@@ -224,6 +252,7 @@ const server = http.createServer(async (req, res) => {
 			if (typeof session !== "string" || !session) throw new Error("missing session");
 			if (kind !== "llm" && kind !== "tool") throw new Error(`bad kind: ${kind}`);
 			if (spec === undefined) throw new Error("missing spec");
+			if (!stringMap(requirements)) throw new Error("requirements must be a string map");
 		} catch (e: any) {
 			res.writeHead(400, { "content-type": "application/json" });
 			res.end(JSON.stringify({ error: `bad request: ${e?.message ?? e}` }));

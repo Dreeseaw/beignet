@@ -1,206 +1,221 @@
-// Sidecar conformance suite. Your Go sidecar passes this or it isn't done.
+// Sidecar wire conformance for the v0.1 pull protocol.
 //
-// Prereqs (three terminals, or backgrounded):
-//   1. node executor.ts                      # :4701
-//   2. <your sidecar>, pointed at :4701      # :4700
-//   3. node conformance.ts [sidecar-url]
-//
-// Exits 0 iff every check passes. Reference implementation: fakecar.ts.
-import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
+// Start a sidecar with no workers, then run:
+//   node executor/conformance.ts [sidecar-url]
+import { createHash, randomUUID } from "node:crypto";
 
 const SIDECAR = process.argv[2] ?? "http://127.0.0.1:4700";
-const EXECUTOR = process.env.BEIGNET_EXECUTOR_URL ?? "http://127.0.0.1:4701";
-const run = `conf-${Date.now().toString(36)}`; // fresh ids: durable ledgers must not dedup across runs
-const dir = mkdtempSync(path.join(os.tmpdir(), "beignet-conf-"));
-
+const run = `conf-${randomUUID()}`;
 let failures = 0;
+
 function check(name: string, ok: boolean, detail = "") {
-	console.log(`${ok ? "PASS" : "FAIL"}  ${name}${ok || !detail ? "" : `  — ${detail}`}`);
+	console.log(`${ok ? "PASS" : "FAIL"}  ${name}${ok || !detail ? "" : ` — ${detail}`}`);
 	if (!ok) failures++;
 }
 
-function toolStep(id: string, command: string) {
-	return {
-		step_id: `${run}:${id}`,
-		session: run,
-		kind: "tool",
-		spec: { tool: "bash", args: { command }, cwd: dir },
-	};
-}
-
-async function post(body: unknown): Promise<{ status: number; body: any; text: string }> {
-	const res = await fetch(`${SIDECAR}/v1/step`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: typeof body === "string" ? body : JSON.stringify(body),
+async function request(method: string, path: string, body?: unknown, contentType = "application/json") {
+	const res = await fetch(`${SIDECAR}${path}`, {
+		method,
+		headers: body === undefined ? undefined : { "content-type": contentType },
+		body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
 	});
 	const text = await res.text();
-	let parsed: any = undefined;
-	try { parsed = JSON.parse(text); } catch {}
-	return { status: res.status, body: parsed, text };
+	let json: any;
+	try { json = JSON.parse(text); } catch {}
+	return { status: res.status, text, json };
 }
 
-async function healthy(url: string): Promise<boolean> {
-	try { return (await fetch(`${url}/healthz`)).ok; } catch { return false; }
-}
-
-// 1. both processes reachable
-check("executor /healthz", await healthy(EXECUTOR), `is executor.ts running on ${EXECUTOR}?`);
-check("sidecar /healthz", await healthy(SIDECAR), `is your sidecar running on ${SIDECAR}?`);
-if (failures) process.exit(1);
-
-// 2. happy path: tool step executes, result carries output
-{
-	const { status, body } = await post(toolStep("happy", "echo conf-$((6 * 7))"));
-	const text = JSON.stringify(body?.result?.content ?? "");
-	check("tool step returns 200 {result}", status === 200 && body?.result != null, `got ${status}: ${JSON.stringify(body)}`);
-	check("result contains command output", /conf-42/.test(text), text.slice(0, 200));
-}
-
-// 3. dedup of a DONE step: same step_id → same body, zero re-execution
-{
-	const step = toolStep("dedup", `echo x >> ${dir}/dedup.txt; wc -l < ${dir}/dedup.txt`);
-	const first = await post(step);
-	const second = await post(step);
-	check("done-dedup: identical response", first.status === 200 && first.text === second.text,
-		`first=${first.text.slice(0, 120)} second=${second.text.slice(0, 120)}`);
-	const lines = readFileSync(`${dir}/dedup.txt`, "utf8").trim();
-	check("done-dedup: executed exactly once", lines === "x", `file content: ${JSON.stringify(lines)}`);
-}
-
-// 4. dedup of a PENDING step: concurrent same-id posts share one execution
-{
-	const step = toolStep("pending", `sleep 2; echo y >> ${dir}/pending.txt; wc -l < ${dir}/pending.txt`);
-	const [a, b] = await Promise.all([post(step), post(step)]);
-	check("pending-dedup: both callers get 200", a.status === 200 && b.status === 200, `${a.status}/${b.status}`);
-	check("pending-dedup: identical response", a.text === b.text,
-		`a=${a.text.slice(0, 120)} b=${b.text.slice(0, 120)}`);
-	const lines = readFileSync(`${dir}/pending.txt`, "utf8").trim();
-	check("pending-dedup: executed exactly once", lines === "y", `file content: ${JSON.stringify(lines)}`);
-}
-
-// 5. toolError is a COMMITTED 200, and dedup applies to it too
-{
-	const step = toolStep("toolerr", "exit 3");
-	const first = await post(step);
-	check("tool failure → 200 with result.toolError", first.status === 200 && /code 3/.test(first.body?.result?.toolError ?? ""),
-		`got ${first.status}: ${first.text.slice(0, 200)}`);
-	const second = await post(step);
-	check("toolError is committed (deduped)", second.text === first.text);
-}
-
-// 6. infra failure (executor 5xx) surfaces as sidecar 5xx {error}
-{
-	const { status, body } = await post({
-		step_id: `${run}:infra`, session: run, kind: "tool",
-		spec: { tool: "not-a-real-tool", args: {}, cwd: dir },
+async function requestBytes(method: string, path: string, body?: Uint8Array) {
+	const res = await fetch(`${SIDECAR}${path}`, {
+		method,
+		headers: body === undefined ? undefined : { "content-type": "application/octet-stream" },
+		body,
 	});
-	check("infra failure → 5xx {error}", status >= 500 && typeof body?.error === "string", `got ${status}: ${JSON.stringify(body)}`);
+	return { status: res.status, bytes: new Uint8Array(await res.arrayBuffer()) };
 }
 
-// 7. malformed requests are rejected and the server survives
-{
-	const bad1 = await post("this is not json");
-	const bad2 = await post({ session: run, kind: "tool", spec: {} }); // missing step_id
-	const bad3 = await post({ step_id: `${run}:badkind`, session: run, kind: "dance", spec: {} });
-	const bad4 = await post({ step_id: `${run}:nosession`, kind: "tool", spec: {} });
-	check("malformed body → 4xx", bad1.status >= 400 && bad1.status < 500, `got ${bad1.status}`);
-	check("missing step_id → 4xx", bad2.status >= 400 && bad2.status < 500, `got ${bad2.status}`);
-	check("unknown kind → 4xx", bad3.status >= 400 && bad3.status < 500, `got ${bad3.status}`);
-	check("missing session → 4xx", bad4.status >= 400 && bad4.status < 500, `got ${bad4.status}`);
-	check("sidecar alive after garbage", await healthy(SIDECAR));
+const post = (path: string, body: unknown) => request("POST", path, body);
+
+try {
+	const health = await request("GET", "/healthz");
+	check("health endpoint", health.status === 200, `HTTP ${health.status}`);
+} catch (error: any) {
+	console.error(`FAIL  sidecar unavailable at ${SIDECAR}: ${error?.message ?? error}`);
+	process.exit(1);
 }
 
-// 8. blob store: put/get roundtrip, hash verification, missing-check
+// Immutable artifact contract.
+const artifact = Uint8Array.from([0x00, 0xff, 0x80, 0x41]);
+const hash = createHash("sha256").update(artifact).digest("hex");
+const missingHash = createHash("sha256").update(`${run}-missing`).digest("hex");
 {
-	const payload = JSON.stringify({ conformance: run, n: 42 });
-	const hash = createHash("sha256").update(payload).digest("hex");
-	const unknown = createHash("sha256").update(`${run}-never-stored`).digest("hex");
+	const missing = await request("GET", `/v1/blob/${missingHash}`);
+	check("unknown artifact is 404", missing.status === 404, `HTTP ${missing.status}`);
 
-	const put = await fetch(`${SIDECAR}/v1/blob/${hash}`, {
-		method: "PUT",
-		headers: { "content-type": "application/octet-stream" },
-		body: payload,
+	const wrong = await requestBytes("PUT", `/v1/blob/${missingHash}`, artifact);
+	check("artifact hash mismatch is rejected", wrong.status === 400, `HTTP ${wrong.status}`);
+
+	const put = await requestBytes("PUT", `/v1/blob/${hash}`, artifact);
+	const repeat = await requestBytes("PUT", `/v1/blob/${hash}`, artifact);
+	check("artifact PUT succeeds", put.status === 200, `HTTP ${put.status}`);
+	check("artifact PUT is idempotent", repeat.status === 200, `HTTP ${repeat.status}`);
+
+	const get = await requestBytes("GET", `/v1/blob/${hash}`);
+	check("artifact GET returns exact bytes",
+		get.status === 200 && get.bytes.length === artifact.length &&
+		get.bytes.every((byte, index) => byte === artifact[index]),
+		`HTTP ${get.status}: ${Array.from(get.bytes).join(",")}`);
+
+	const batch = await post("/v1/blobs/missing", { hashes: [hash, missingHash] });
+	check("artifact missing check returns only absent hashes",
+		batch.status === 200 && JSON.stringify(batch.json?.missing) === JSON.stringify([missingHash]),
+		`HTTP ${batch.status}: ${batch.text}`);
+}
+
+// Request validation leaves no work behind.
+{
+	const invalidJSON = await post("/v1/step", "not json");
+	const missingID = await post("/v1/step", { session: run, kind: "tool", spec: {} });
+	const badKind = await post("/v1/step", { step_id: `${run}-bad`, session: run, kind: "dance", spec: {} });
+	const missingWorker = await post("/v1/work/claim", { labels: {} });
+	check("invalid JSON is rejected", invalidJSON.status === 400, `HTTP ${invalidJSON.status}`);
+	check("missing step id is rejected", missingID.status === 400, `HTTP ${missingID.status}`);
+	check("unknown step kind is rejected", badKind.status === 400, `HTTP ${badKind.status}`);
+	check("missing worker id is rejected", missingWorker.status === 400, `HTTP ${missingWorker.status}`);
+}
+
+// Claim, renew, fence, atomic successor insertion, and requirement inheritance.
+const firstID = `${run}-z-first`;
+const nextID = `${run}-a-next`;
+const competingID = `${run}-competing`;
+const first = {
+	step_id: firstID,
+	session: run,
+	kind: "tool",
+	spec: { tool: "bash", args: { command: "echo conformance" }, cwd: "/tmp" },
+	requirements: { pool: "gpu" },
+};
+const claimRequest = { worker_id: "worker-a", labels: { pool: "gpu", zone: "test" } };
+let claim: any;
+{
+	const submit = await post("/v1/step?wait=false", first);
+	check("detached submission is accepted", submit.status === 202 && submit.json?.step_id === firstID,
+		`HTTP ${submit.status}: ${submit.text}`);
+
+	const mismatch = await post("/v1/work/claim", { worker_id: "worker-b", labels: { pool: "cpu" } });
+	check("ineligible worker receives no work", mismatch.status === 204, `HTTP ${mismatch.status}`);
+
+	const won = await post("/v1/work/claim", claimRequest);
+	claim = won.json;
+	check("eligible worker claims the step",
+		won.status === 200 && claim?.step_id === firstID && claim?.attempt === 0,
+		`HTTP ${won.status}: ${won.text}`);
+	check("claim preserves opaque spec and requirements",
+		JSON.stringify(claim?.spec) === JSON.stringify(first.spec) && claim?.requirements?.pool === "gpu");
+
+	const queued = await post("/v1/step?wait=false", {
+		step_id: competingID,
+		session: `${run}-competition`,
+		kind: "tool",
+		spec: { tool: "bash", args: { command: "echo competing" }, cwd: "/tmp" },
+		requirements: { pool: "gpu", zone: "test" },
 	});
-	check("blob PUT → 200", put.status === 200, `got ${put.status}`);
+	check("competing eligible work is queued", queued.status === 202, `HTTP ${queued.status}: ${queued.text}`);
 
-	const rePut = await fetch(`${SIDECAR}/v1/blob/${hash}`, { method: "PUT", body: payload });
-	check("blob re-PUT is idempotent 200", rePut.status === 200, `got ${rePut.status}`);
+	const retry = await post("/v1/work/claim", claimRequest);
+	check("ambiguous claim retry returns the same attempt",
+		retry.status === 200 && retry.json?.step_id === firstID && retry.json?.attempt === claim.attempt,
+		`HTTP ${retry.status}: ${retry.text}`);
 
-	const get = await fetch(`${SIDECAR}/v1/blob/${hash}`);
-	const roundTrip = await get.text();
-	check("blob GET returns exact bytes", get.status === 200 && roundTrip === payload,
-		`got ${get.status}: ${roundTrip.slice(0, 120)}`);
-
-	const notFound = await fetch(`${SIDECAR}/v1/blob/${unknown}`);
-	check("unknown blob → 404", notFound.status === 404, `got ${notFound.status}`);
-
-	const liar = await fetch(`${SIDECAR}/v1/blob/${unknown}`, { method: "PUT", body: payload });
-	check("blob PUT with wrong hash → 400", liar.status === 400, `got ${liar.status}`);
-
-	const missing = await fetch(`${SIDECAR}/v1/blobs/missing`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ hashes: [hash, unknown] }),
+	const staleRenew = await post("/v1/work/renew", {
+		worker_id: "worker-a", step_id: firstID, attempt: claim.attempt + 1,
 	});
-	const body = await missing.json().catch(() => undefined);
-	check("blobs/missing splits correctly",
-		missing.status === 200 && JSON.stringify(body?.missing) === JSON.stringify([unknown]),
-		`got ${missing.status}: ${JSON.stringify(body)}`);
+	const renew = await post("/v1/work/renew", {
+		worker_id: "worker-a", step_id: firstID, attempt: claim.attempt,
+	});
+	check("stale renewal is fenced", staleRenew.status === 409 && staleRenew.json?.renewed === false,
+		`HTTP ${staleRenew.status}: ${staleRenew.text}`);
+	check("current owner can renew", renew.status === 200 && renew.json?.renewed === true,
+		`HTTP ${renew.status}: ${renew.text}`);
+
+	const staleCommit = await post("/v1/work/commit", {
+		worker_id: "worker-b", step_id: firstID, attempt: claim.attempt,
+		result: { value: "stale" },
+	});
+	check("non-owner commit is fenced", staleCommit.status === 409 && staleCommit.json?.committed === false,
+		`HTTP ${staleCommit.status}: ${staleCommit.text}`);
+	const wrongAttemptCommit = await post("/v1/work/commit", {
+		worker_id: "worker-a", step_id: firstID, attempt: claim.attempt + 1,
+		result: { value: "wrong attempt" },
+	});
+	check("same-owner wrong-attempt commit is fenced",
+		wrongAttemptCommit.status === 409 && wrongAttemptCommit.json?.committed === false,
+		`HTTP ${wrongAttemptCommit.status}: ${wrongAttemptCommit.text}`);
+
+	const commit = await post("/v1/work/commit", {
+		worker_id: "worker-a",
+		step_id: firstID,
+		attempt: claim.attempt,
+		result: { value: "accepted" },
+		next: { step_id: nextID, session: run, kind: "llm", spec: { model: "opaque" } },
+	});
+	check("current owner commits result and successor", commit.status === 200 && commit.json?.committed === true,
+		`HTTP ${commit.status}: ${commit.text}`);
+
+	const dedup = await post("/v1/step", first);
+	check("completed step deduplicates without execution",
+		dedup.status === 200 && dedup.json?.result?.value === "accepted",
+		`HTTP ${dedup.status}: ${dedup.text}`);
 }
 
-// 9. fire-and-forget submission: ?wait=false returns immediately
 {
-	const step = toolStep("nowait", `echo nowait >> ${dir}/nowait.txt`);
-	const res = await fetch(`${SIDECAR}/v1/step?wait=false`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(step),
-	});
-	const body = await res.json().catch(() => undefined);
-	check("wait=false → 202 {step_id}", res.status === 202 && body?.step_id === step.step_id,
-		`got ${res.status}: ${JSON.stringify(body)}`);
+	const mismatch = await post("/v1/work/claim", { worker_id: "worker-b", labels: { pool: "cpu" } });
+	check("successor inherits routing requirements", mismatch.status === 204, `HTTP ${mismatch.status}`);
 
-	// The work still happens with nobody waiting.
-	const deadline = Date.now() + 15000;
-	let ran = false;
-	while (Date.now() < deadline && !ran) {
-		const again = await post(step); // long-poll dedups into the same execution
-		ran = again.status === 200;
-		if (!ran) await new Promise((r) => setTimeout(r, 200));
-	}
-	check("wait=false work completes unattended", ran);
+	const next = await post("/v1/work/claim", { worker_id: "worker-b", labels: { pool: "gpu" } });
+	check("eligible worker claims atomic successor",
+		next.status === 200 && next.json?.step_id === nextID && next.json?.requirements?.pool === "gpu",
+		`HTTP ${next.status}: ${next.text}`);
+	const finish = await post("/v1/work/commit", {
+		worker_id: "worker-b", step_id: nextID, attempt: next.json?.attempt,
+		result: { stopReason: "stop" },
+	});
+	check("successor result commits", finish.status === 200 && finish.json?.committed === true,
+		`HTTP ${finish.status}: ${finish.text}`);
+
+	const competing = await post("/v1/work/claim", {
+		worker_id: "worker-c", labels: { pool: "gpu", zone: "test" },
+	});
+	check("competing probe step is drained",
+		competing.status === 200 && competing.json?.step_id === competingID,
+		`HTTP ${competing.status}: ${competing.text}`);
+	const competingFinish = await post("/v1/work/commit", {
+		worker_id: "worker-c", step_id: competingID, attempt: competing.json?.attempt,
+		result: { stopReason: "probe complete" },
+	});
+	check("competing probe result commits",
+		competingFinish.status === 200 && competingFinish.json?.committed === true,
+		`HTTP ${competingFinish.status}: ${competingFinish.text}`);
 }
 
-// 10. session read route: ordered, contains what we submitted
+// Session reads expose committed history in insertion order.
 {
-	const res = await fetch(`${SIDECAR}/v1/session/${encodeURIComponent(run)}/steps`);
-	const body = await res.json().catch(() => undefined);
-	const list = body?.steps;
-	check("session route → 200 {steps: [...]}", res.status === 200 && Array.isArray(list),
-		`got ${res.status}: ${JSON.stringify(body)?.slice(0, 160)}`);
-	if (Array.isArray(list)) {
-		check("session steps carry index/step_id/kind/state",
-			list.length > 0 && list.every((s: any) =>
-				typeof s.index === "number" && typeof s.step_id === "string" &&
-				typeof s.kind === "string" && typeof s.state === "string"),
-			JSON.stringify(list[0])?.slice(0, 160));
-		check("session steps are in submission order",
-			list.every((s: any, i: number) => s.index === i));
+	const session = await request("GET", `/v1/session/${encodeURIComponent(run)}/steps`);
+	const listed = session.json?.steps;
+	check("session route returns both steps", session.status === 200 && listed?.length === 2,
+		`HTTP ${session.status}: ${session.text}`);
+	check("session order and results are stable",
+		listed?.[0]?.step_id === firstID && listed?.[0]?.result?.value === "accepted" &&
+		listed?.[1]?.step_id === nextID && listed?.[1]?.result?.stopReason === "stop");
 
-		const sinceRes = await fetch(`${SIDECAR}/v1/session/${encodeURIComponent(run)}/steps?since=1`);
-		const sinceBody = await sinceRes.json().catch(() => undefined);
-		check("?since=N skips the first N", sinceBody?.steps?.length === list.length - 1,
-			`full=${list.length} since1=${sinceBody?.steps?.length}`);
-	}
-	const empty = await fetch(`${SIDECAR}/v1/session/no-such-session-${run}/steps`);
-	const emptyBody = await empty.json().catch(() => undefined);
-	check("unknown session → 200 with empty list",
-		empty.status === 200 && Array.isArray(emptyBody?.steps) && emptyBody.steps.length === 0,
-		`got ${empty.status}: ${JSON.stringify(emptyBody)}`);
+	const since = await request("GET", `/v1/session/${encodeURIComponent(run)}/steps?since=1`);
+	check("session cursor skips earlier steps",
+		since.status === 200 && since.json?.steps?.length === 1 && since.json.steps[0].index === 1,
+		`HTTP ${since.status}: ${since.text}`);
+
+	const empty = await request("GET", `/v1/session/no-such-${run}/steps`);
+	check("unknown session is an empty list", empty.status === 200 && empty.json?.steps?.length === 0,
+		`HTTP ${empty.status}: ${empty.text}`);
 }
 
 console.log(failures ? `\n${failures} FAILED` : "\nALL PASS");
