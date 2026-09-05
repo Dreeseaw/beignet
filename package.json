@@ -5,6 +5,7 @@
   "description": "beignet TS side: executor/ (steps + turn chaining + reference sidecar) and head/ (client CLI)",
   "scripts": {
     "executor": "node executor/executor.ts",
+    "worker": "node executor/worker.ts",
     "fakecar": "node executor/fakecar.ts",
     "head": "node head/head.ts",
     "test": "node --test executor/test/*.test.ts",
