@@ -17,7 +17,7 @@ import {
 	createLsToolDefinition,
 	createReadToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { BlobClient, stepIdOf } from "../executor/blobs.ts";
+import { BlobClient, newStepId } from "../executor/blobs.ts";
 import { buildLlmSpec, stage, type ContextRefs } from "../executor/chain.ts";
 
 const SIDECAR = process.env.BEIGNET_SIDECAR_URL ?? "http://127.0.0.1:4700";
@@ -112,8 +112,8 @@ async function start() {
 	}
 
 	await blobs.putMissing(staged);
-	const spec = { ...buildLlmSpec(model, context, options), cwd };
-	const stepId = stepIdOf("llm", spec);
+	const spec = buildLlmSpec(model, context, options, cwd);
+	const stepId = newStepId();
 	const res = await fetch(`${SIDECAR}/v1/step?wait=false`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },

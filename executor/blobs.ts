@@ -1,6 +1,4 @@
-// Content-addressed blob client + step-id derivation.
-// Shared by the executor (chaining) and the head (turn start).
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export function sha256(data: string): string {
 	return createHash("sha256").update(data).digest("hex");
@@ -10,8 +8,9 @@ export function hashOf(value: unknown): string {
 	return sha256(JSON.stringify(value));
 }
 
-export function stepIdOf(kind: string, spec: unknown): string {
-	return sha256(JSON.stringify({ kind, spec }));
+// Random IDs let identical inputs represent distinct sampling requests.
+export function newStepId(): string {
+	return randomUUID();
 }
 
 export class BlobClient {
@@ -31,7 +30,6 @@ export class BlobClient {
 		return JSON.parse(await this.get(hash));
 	}
 
-	/** Upload only what the cluster lacks. Returns nothing; hashes are derivable. */
 	async putMissing(blobs: Map<string, unknown>): Promise<void> {
 		if (blobs.size === 0) return;
 		const res = await fetch(`${this.sidecar}/v1/blobs/missing`, {
@@ -44,7 +42,7 @@ export class BlobClient {
 		await Promise.all(missing.map((hash) => this.putOne(hash, blobs.get(hash))));
 	}
 
-	/** Store one value, return its hash. Blobs must land before any step referencing them. */
+	// Uploads precede step submission so Raft never references missing bytes.
 	async put(value: unknown): Promise<string> {
 		const hash = hashOf(value);
 		await this.putOne(hash, value);
