@@ -17,14 +17,15 @@ import (
 
 // Core objects
 type HTTPServer struct {
-	raft     *raft.Raft
-	blobs    *sync.Map
-	steps    *sync.Map
-	nodes    *sync.Map
-	execErr  *sync.Map // node-local: stepID -> last executor failure (not replicated)
-	nodeID   string
-	httpAddr string
-	execAddr string
+	raft          *raft.Raft
+	blobs         *sync.Map // hash -> ArtifactMeta; immutable bytes live in artifactStore
+	steps         *sync.Map
+	nodes         *sync.Map
+	execErr       *sync.Map // node-local: stepID -> last executor failure (not replicated)
+	artifactStore ArtifactStore
+	nodeID        string
+	httpAddr      string
+	execAddr      string
 }
 
 func main() {
@@ -35,7 +36,13 @@ func main() {
 	execAddr := flag.String("executor", "http://127.0.0.1:4701", "Local executor base URL")
 	raftAddr := flag.String("raft", "127.0.0.1:7000", "Raft comms address")
 	joinAddr := flag.String("join", "", "HTTP address of the existing leader to join (leave blank for node1)")
+	artifactDir := flag.String("artifact-dir", "artifact-data", "Filesystem artifact directory (single node or a shared mount)")
 	flag.Parse()
+
+	artifactStore, err := NewFileArtifactStore(*artifactDir)
+	if err != nil {
+		log.Fatalf("failed to initialize artifact store: %v", err)
+	}
 
 	// Make service objects
 	blobs := &sync.Map{}
@@ -97,14 +104,15 @@ func main() {
 
 	// Start HTTP Server
 	srv := &HTTPServer{
-		raft:     r,
-		blobs:    blobs,
-		steps:    steps,
-		nodes:    nodes,
-		execErr:  &sync.Map{},
-		nodeID:   *nodeID,
-		httpAddr: *httpAddr,
-		execAddr: *execAddr,
+		raft:          r,
+		blobs:         blobs,
+		steps:         steps,
+		nodes:         nodes,
+		execErr:       &sync.Map{},
+		artifactStore: artifactStore,
+		nodeID:        *nodeID,
+		httpAddr:      *httpAddr,
+		execAddr:      *execAddr,
 	}
 	http.HandleFunc("GET /join", srv.joinHandler)
 	http.HandleFunc("GET /healthz", srv.healthzHandler)

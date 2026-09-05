@@ -39,12 +39,13 @@ func TestMain(m *testing.M) {
 // ---------- cluster harness ----------
 
 type node struct {
-	id       string
-	httpAddr string
-	raftAddr string
-	dir      string
-	logPath  string
-	cmd      *exec.Cmd
+	id          string
+	httpAddr    string
+	raftAddr    string
+	artifactDir string
+	dir         string
+	logPath     string
+	cmd         *exec.Cmd
 }
 
 func freeAddrs(t *testing.T, count int) []string {
@@ -73,17 +74,23 @@ func newNode(t *testing.T, id, httpAddr, raftAddr string) *node {
 		t.Fatal(err)
 	}
 	return &node{
-		id:       id,
-		httpAddr: httpAddr,
-		raftAddr: raftAddr,
-		dir:      dir, // node writes raft-data/<id> relative to cwd
-		logPath:  filepath.Join(dir, "node.log"),
+		id:          id,
+		httpAddr:    httpAddr,
+		raftAddr:    raftAddr,
+		artifactDir: filepath.Join(dir, "artifacts"),
+		dir:         dir, // node writes raft-data/<id> relative to cwd
+		logPath:     filepath.Join(dir, "node.log"),
 	}
 }
 
 func (n *node) start(t *testing.T, joinAddr string) {
 	t.Helper()
-	args := []string{"--id", n.id, "--http", n.httpAddr, "--raft", n.raftAddr}
+	args := []string{
+		"--id", n.id,
+		"--http", n.httpAddr,
+		"--raft", n.raftAddr,
+		"--artifact-dir", n.artifactDir,
+	}
 	if joinAddr != "" {
 		args = append(args, "--join", joinAddr)
 	}
@@ -229,6 +236,11 @@ func startCluster(t *testing.T) []*node {
 		newNode(t, "node1", addrs[0], addrs[1]),
 		newNode(t, "node2", addrs[2], addrs[3]),
 		newNode(t, "node3", addrs[4], addrs[5]),
+	}
+	// Filesystem storage is cluster-safe only on a genuinely shared mount.
+	sharedArtifacts := filepath.Join(t.TempDir(), "shared-artifacts")
+	for _, n := range nodes {
+		n.artifactDir = sharedArtifacts
 	}
 	dumpLogsOnFailure(t, nodes)
 

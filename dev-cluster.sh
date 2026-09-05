@@ -51,6 +51,7 @@ for i in 1 2 3; do
       --http "127.0.0.1:47${i}0" \
       --raft "127.0.0.1:700${i}" \
       --executor "http://127.0.0.1:47${i}1" \
+      --artifact-dir "$RUN/artifacts" \
       ${i:+$([[ $i -eq 1 ]] || echo "--join 127.0.0.1:4710")} \
     ) > "$RUN/node$i.log" 2>&1 &
   PIDS+=($!)
