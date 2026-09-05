@@ -27,6 +27,9 @@ if [[ -z "$LIVE" ]]; then
 SCRIPT
 fi
 
+WORKER_ENV=()
+[[ -z "$LIVE" ]] && WORKER_ENV=("BEIGNET_FAKE_LLM=$RUN/script.json")
+
 PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
@@ -53,8 +56,7 @@ for i in 1 2 3; do
   env BEIGNET_SIDECAR_URL="http://127.0.0.1:47${i}0" \
       BEIGNET_WORKER_ID="node$i-worker" \
       BEIGNET_WORKER_LABELS="{\"pool\":\"default\",\"node\":\"node$i\"}" \
-      ${LIVE:+BEIGNET_MODEL=anthropic/claude-haiku-4-5} \
-      ${LIVE:-BEIGNET_FAKE_LLM=$RUN/script.json} \
+      "${WORKER_ENV[@]}" \
       node "$REPO/executor/worker.ts" > "$RUN/worker$i.log" 2>&1 &
   PIDS+=($!)
 done
