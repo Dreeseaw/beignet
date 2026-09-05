@@ -1,15 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"sync"
 	"testing"
 )
 
 // The FSM is just structs and maps — no raft needed to test any invariant.
 func newFSM() *FSM {
-	return &FSM{blobs: &sync.Map{}, steps: &sync.Map{}}
+	return &FSM{blobs: &sync.Map{}, steps: &sync.Map{}, nodes: &sync.Map{}}
 }
+
+type memorySnapshotSink struct {
+	bytes.Buffer
+	closed   bool
+	canceled bool
+	closeErr error
+}
+
+func (s *memorySnapshotSink) ID() string    { return "memory" }
+func (s *memorySnapshotSink) Close() error  { s.closed = true; return s.closeErr }
+func (s *memorySnapshotSink) Cancel() error { s.canceled = true; return nil }
 
 func apply(t *testing.T, fsm *FSM, typ OpType, data any) any {
 	t.Helper()
@@ -198,5 +212,77 @@ func TestPutBlobIsIdempotent(t *testing.T) {
 	v, ok := fsm.blobs.Load("h1")
 	if !ok || string(v.([]byte)) != "hello" {
 		t.Errorf("blob = %v, want hello", v)
+	}
+}
+
+func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
+	fsm := newFSM()
+	apply(t, fsm, OpPutBlob, PutBlobOp{Key: "h1", Value: []byte("hello")})
+	apply(t, fsm, OpSetNode, SetNodeOp{NodeID: "node1", HTTPAddr: "127.0.0.1:4700"})
+	submit(t, fsm, "s1", "sess")
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
+	for i := 0; i < 7; i++ {
+		apply(t, fsm, OpTick, struct{}{})
+	}
+	apply(t, fsm, OpCommitResult, CommitResultOp{
+		StepID: "s1", NodeID: "node1", Attempt: claim.Attempt,
+		Result: json.RawMessage(`{"content":"ok"}`),
+		Next: &NextStep{
+			StepID: "s2", Session: "sess", Kind: "llm", Spec: json.RawMessage(`{"model":"m"}`),
+		},
+	})
+
+	snapshotBeforeMutation, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply(t, fsm, OpPutBlob, PutBlobOp{Key: "later", Value: []byte("after snapshot")})
+
+	sink := &memorySnapshotSink{}
+	if err := snapshotBeforeMutation.Persist(sink); err != nil {
+		t.Fatal(err)
+	}
+	if !sink.closed || sink.canceled {
+		t.Fatalf("snapshot sink lifecycle: closed=%v canceled=%v", sink.closed, sink.canceled)
+	}
+
+	restored := newFSM()
+	if err := restored.Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	if restored.tick != 7 || restored.seq != 2 {
+		t.Fatalf("restored counters: tick=%d seq=%d, want 7 and 2", restored.tick, restored.seq)
+	}
+	if v, ok := restored.blobs.Load("h1"); !ok || string(v.([]byte)) != "hello" {
+		t.Fatalf("restored blob = %q, present=%v", v, ok)
+	}
+	if _, ok := restored.blobs.Load("later"); ok {
+		t.Fatal("snapshot included a mutation made after Snapshot returned")
+	}
+	if v, ok := restored.nodes.Load("node1"); !ok || v.(string) != "127.0.0.1:4700" {
+		t.Fatalf("restored node address = %q, present=%v", v, ok)
+	}
+	if got := step(t, restored, "s1"); got.State != StateDone || string(got.Result) != `{"content":"ok"}` {
+		t.Fatalf("restored completed step = %+v", got)
+	}
+	if got := step(t, restored, "s2"); got.State != StatePending || got.Seq != 2 {
+		t.Fatalf("restored successor = %+v", got)
+	}
+}
+
+func TestSnapshotCloseFailureCancelsSink(t *testing.T) {
+	fsm := newFSM()
+	snapshot, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("close failed")
+	sink := &memorySnapshotSink{closeErr: closeErr}
+
+	if err := snapshot.Persist(sink); !errors.Is(err, closeErr) {
+		t.Fatalf("Persist error = %v, want close failure", err)
+	}
+	if !sink.closed || !sink.canceled {
+		t.Fatalf("failed snapshot sink lifecycle: closed=%v canceled=%v", sink.closed, sink.canceled)
 	}
 }
