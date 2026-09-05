@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"sync"
 
 	"github.com/hashicorp/raft"
@@ -31,7 +32,7 @@ type FSM struct {
 
 // A claim goes stale after this many ticks (1 tick/sec), at which point the
 // step returns to Pending for anyone to re-run. Workers renew while executing,
-// so this bounds recovery time after a node dies, not step duration.
+// so this bounds recovery time after a worker dies, not step duration.
 const leaseTicks = 30
 
 type StepState string
@@ -44,16 +45,17 @@ const (
 
 // Step is the sync.Map value: one LLM call or one tool call.
 type Step struct {
-	ID        string          `json:"id"`
-	Session   string          `json:"session"`
-	Kind      string          `json:"kind"`
-	Spec      json.RawMessage `json:"spec"`
-	State     StepState       `json:"state"`
-	Owner     string          `json:"owner,omitempty"`
-	ClaimTick uint64          `json:"claim_tick,omitempty"`
-	Attempt   int             `json:"attempt"`
-	Seq       uint64          `json:"seq"`
-	Result    json.RawMessage `json:"result,omitempty"`
+	ID           string            `json:"id"`
+	Session      string            `json:"session"`
+	Kind         string            `json:"kind"`
+	Spec         json.RawMessage   `json:"spec"`
+	Requirements map[string]string `json:"requirements,omitempty"`
+	State        StepState         `json:"state"`
+	Owner        string            `json:"owner,omitempty"`
+	ClaimTick    uint64            `json:"claim_tick,omitempty"`
+	Attempt      int               `json:"attempt"`
+	Seq          uint64            `json:"seq"`
+	Result       json.RawMessage   `json:"result,omitempty"`
 }
 
 type ArtifactMeta struct {
@@ -64,22 +66,29 @@ type ArtifactMeta struct {
 // A step owns its own lifecycle. These three rules are the entire distributed
 // contract, and they're pure functions on a value — no map, no raft, no FSM.
 
-// claim takes ownership if the step is free or already ours. Idempotent for
-// the owner, so a retry and a lease renewal are the same operation.
-func (s *Step) claim(node string, tick uint64) bool {
-	if s.Owner != "" && s.Owner != node {
+// A same-worker retry returns the existing claim after an ambiguous response.
+func (s *Step) claim(worker string, tick uint64) bool {
+	if s.Owner != "" && s.Owner != worker {
 		return false
 	}
 	s.State = StateClaimed
-	s.Owner = node
+	s.Owner = worker
+	s.ClaimTick = tick
+	return true
+}
+
+func (s *Step) renew(worker string, attempt int, tick uint64) bool {
+	if s.State != StateClaimed || s.Owner != worker || s.Attempt != attempt {
+		return false
+	}
 	s.ClaimTick = tick
 	return true
 }
 
 // commit stores the result only if the caller still owns THIS attempt.
 // A zombie whose lease expired fails here — that's the fence.
-func (s *Step) commit(node string, attempt int, result json.RawMessage) bool {
-	if s.Owner != node || s.Attempt != attempt {
+func (s *Step) commit(worker string, attempt int, result json.RawMessage) bool {
+	if s.Owner != worker || s.Attempt != attempt {
 		return false
 	}
 	s.State = StateDone
@@ -106,6 +115,7 @@ const (
 	OpPutBlob      OpType = "PutBlob"
 	OpSubmitStep   OpType = "SubmitStep"
 	OpClaimStep    OpType = "ClaimStep"
+	OpRenewStep    OpType = "RenewStep"
 	OpCommitResult OpType = "CommitResult"
 	OpTick         OpType = "Tick"
 	OpSetNode      OpType = "SetNode"
@@ -123,15 +133,22 @@ type PutBlobOp struct {
 }
 
 type SubmitStepOp struct {
-	StepID  string          `json:"step_id"`
-	Session string          `json:"session"`
-	Kind    string          `json:"kind"`
-	Spec    json.RawMessage `json:"spec"`
+	StepID       string            `json:"step_id"`
+	Session      string            `json:"session"`
+	Kind         string            `json:"kind"`
+	Spec         json.RawMessage   `json:"spec"`
+	Requirements map[string]string `json:"requirements,omitempty"`
 }
 
 type ClaimStepOp struct {
-	StepID string `json:"step_id"`
-	NodeID string `json:"node_id"`
+	StepID   string `json:"step_id"`
+	WorkerID string `json:"worker_id"`
+}
+
+type RenewStepOp struct {
+	StepID   string `json:"step_id"`
+	WorkerID string `json:"worker_id"`
+	Attempt  int    `json:"attempt"`
 }
 
 // NextStep is the successor the executor computed. Opaque to us: we carry it.
@@ -143,11 +160,11 @@ type NextStep struct {
 }
 
 type CommitResultOp struct {
-	StepID  string          `json:"step_id"`
-	NodeID  string          `json:"node_id"`
-	Attempt int             `json:"attempt"`
-	Result  json.RawMessage `json:"result"`
-	Next    *NextStep       `json:"next,omitempty"`
+	StepID   string          `json:"step_id"`
+	WorkerID string          `json:"worker_id"`
+	Attempt  int             `json:"attempt"`
+	Result   json.RawMessage `json:"result"`
+	Next     *NextStep       `json:"next,omitempty"`
 }
 
 type Payload struct {
@@ -163,6 +180,11 @@ type ClaimVerdict struct {
 	Reason  string `json:"reason,omitempty"`
 }
 
+type RenewVerdict struct {
+	Renewed bool   `json:"renewed"`
+	Reason  string `json:"reason,omitempty"`
+}
+
 type CommitVerdict struct {
 	Committed bool   `json:"committed"`
 	Reason    string `json:"reason,omitempty"` // duplicate | fenced | unknown step
@@ -170,13 +192,13 @@ type CommitVerdict struct {
 
 // insertStep adds a Pending step if the id is new. Reports whether it inserted.
 // The only place steps are created, so Seq can't drift.
-func (fsm *FSM) insertStep(id, session, kind string, spec json.RawMessage) bool {
+func (fsm *FSM) insertStep(id, session, kind string, spec json.RawMessage, requirements map[string]string) bool {
 	if _, exists := fsm.steps.Load(id); exists {
 		return false // dedup
 	}
 	fsm.seq++
 	fsm.steps.Store(id, Step{
-		ID: id, Session: session, Kind: kind, Spec: spec,
+		ID: id, Session: session, Kind: kind, Spec: spec, Requirements: maps.Clone(requirements),
 		State: StatePending, Seq: fsm.seq,
 	})
 	return true
@@ -215,17 +237,11 @@ func (fsm *FSM) coreApply(p *Payload) any {
 		}
 
 	case OpSubmitStep:
-		// on raft apply, each node should trigger a worker chan to asyncly
-		// attempt to claim the step
 		var op SubmitStepOp
 		if err := json.Unmarshal(p.Data, &op); err != nil {
 			return fmt.Errorf("invalid SubmitStep data: %w", err)
 		}
-		fsm.insertStep(op.StepID, op.Session, op.Kind, op.Spec)
-
-		// after each node stores the new step, launch the async job on the worker channel
-		// for the node itself to broadcast a ClaimStep op for execution
-		// TODO: ^
+		fsm.insertStep(op.StepID, op.Session, op.Kind, op.Spec, op.Requirements)
 
 	case OpClaimStep:
 		var op ClaimStepOp
@@ -240,11 +256,27 @@ func (fsm *FSM) coreApply(p *Payload) any {
 		if step.State == StateDone {
 			return ClaimVerdict{Reason: "already done"}
 		}
-		if !step.claim(op.NodeID, fsm.tick) { // CAS through consensus
+		if !step.claim(op.WorkerID, fsm.tick) { // CAS through consensus
 			return ClaimVerdict{Reason: "owned by " + step.Owner}
 		}
 		fsm.steps.Store(op.StepID, step)
 		return ClaimVerdict{Won: true, Attempt: step.Attempt}
+
+	case OpRenewStep:
+		var op RenewStepOp
+		if err := json.Unmarshal(p.Data, &op); err != nil {
+			return fmt.Errorf("invalid RenewStep data: %w", err)
+		}
+		v, found := fsm.steps.Load(op.StepID)
+		if !found {
+			return RenewVerdict{Reason: "unknown step"}
+		}
+		step := v.(Step)
+		if !step.renew(op.WorkerID, op.Attempt, fsm.tick) {
+			return RenewVerdict{Reason: "fenced"}
+		}
+		fsm.steps.Store(op.StepID, step)
+		return RenewVerdict{Renewed: true}
 
 	case OpCommitResult:
 		var op CommitResultOp
@@ -259,7 +291,7 @@ func (fsm *FSM) coreApply(p *Payload) any {
 		if step.State == StateDone {
 			return CommitVerdict{Reason: "duplicate"}
 		}
-		if !step.commit(op.NodeID, op.Attempt, op.Result) {
+		if !step.commit(op.WorkerID, op.Attempt, op.Result) {
 			return CommitVerdict{Reason: "fenced"} // a zombie's late result
 		}
 		fsm.steps.Store(op.StepID, step)
@@ -267,7 +299,7 @@ func (fsm *FSM) coreApply(p *Payload) any {
 		// ATOMIC with the commit: the successor enters the ledger in this same
 		// Apply, so no crash can strand a turn between "done" and "chained".
 		if op.Next != nil {
-			fsm.insertStep(op.Next.StepID, op.Next.Session, op.Next.Kind, op.Next.Spec)
+			fsm.insertStep(op.Next.StepID, op.Next.Session, op.Next.Kind, op.Next.Spec, step.Requirements)
 		}
 		return CommitVerdict{Committed: true}
 
@@ -344,6 +376,7 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 		step := v.(Step)
 		step.Spec = append(json.RawMessage(nil), step.Spec...)
 		step.Result = append(json.RawMessage(nil), step.Result...)
+		step.Requirements = maps.Clone(step.Requirements)
 		state.Steps[k.(string)] = step
 		return true
 	})
@@ -387,6 +420,7 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	for k, step := range state.Steps {
 		step.Spec = append(json.RawMessage(nil), step.Spec...)
 		step.Result = append(json.RawMessage(nil), step.Result...)
+		step.Requirements = maps.Clone(step.Requirements)
 		f.steps.Store(k, step)
 	}
 	for k, v := range state.Nodes {
