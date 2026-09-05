@@ -1,21 +1,20 @@
 // Fake sidecar: the beignet wire contract with an in-memory ledger.
 // Stand-in for the Go sidecar during development, and the test double for CI.
-// Mirrors what the FSM must do — notably: a step's result and its `next`
-// commit ATOMICALLY, and the node that commits immediately picks up `next`
-// (turn affinity). Usage: node fakecar.ts
+// Mirrors the FSM's atomic commit + successor insertion and fenced pull work.
 import http from "node:http";
 import { createHash } from "node:crypto";
 
 const PORT = Number(process.env.BEIGNET_SIDECAR_PORT ?? 4700);
-const EXECUTOR = process.env.BEIGNET_EXECUTOR_URL ?? "http://127.0.0.1:4701";
 
 type Step = {
 	id: string;
 	session: string;
 	kind: string;
 	spec: any;
-	state: "pending" | "done";
-	ok?: boolean;
+	requirements: Record<string, string>;
+	state: "pending" | "claimed" | "done";
+	owner?: string;
+	attempt: number;
 	payload?: any;
 	waiters: Array<(step: Step) => void>;
 };
@@ -23,12 +22,21 @@ type Step = {
 const steps = new Map<string, Step>();
 const order = new Map<string, string[]>(); // session -> step ids, submission order
 const blobs = new Map<string, string>();
-const inFlight = new Set<string>();
+let renewals = 0;
 
-function submit(id: string, session: string, kind: string, spec: any): Step {
+function submit(
+	id: string,
+	session: string,
+	kind: string,
+	spec: any,
+	requirements: Record<string, string> = {},
+): Step {
 	const existing = steps.get(id);
 	if (existing) return existing; // dedup: SubmitStep is a no-op if id exists
-	const step: Step = { id, session, kind, spec, state: "pending", waiters: [] };
+	const step: Step = {
+		id, session, kind, spec, requirements: { ...requirements },
+		state: "pending", attempt: 0, waiters: [],
+	};
 	steps.set(id, step);
 	if (!order.has(session)) order.set(session, []);
 	order.get(session)!.push(id);
@@ -39,52 +47,27 @@ function submit(id: string, session: string, kind: string, spec: any): Step {
 }
 
 /** Apply(CommitResult): mark Done and insert `next` in one transition. */
-function commit(step: Step, ok: boolean, payload: any, next?: any): Step | undefined {
-	if (step.state === "done") return undefined; // Duplicate
+function commit(step: Step, payload: any, next?: any): void {
 	step.state = "done";
-	step.ok = ok;
 	step.payload = payload;
-	let successor: Step | undefined;
-	if (ok && next) successor = submit(next.step_id, next.session ?? step.session, next.kind, next.spec);
-	console.error(`[fakecar] ${step.id.slice(0, 12)} committed ok=${ok}${next ? " +next" : ""}`);
+	if (next) submit(next.step_id, next.session, next.kind, next.spec, step.requirements);
+	console.error(`[fakecar] ${step.id.slice(0, 12)} committed${next ? " +next" : ""}`);
 	for (const waiter of step.waiters) waiter(step);
 	step.waiters = [];
-	return successor;
 }
 
-/** Worker: execute a pending step, commit, then follow the chain (affinity). */
-async function work(id: string): Promise<void> {
-	let current: string | undefined = id;
-	while (current) {
-		const step = steps.get(current);
-		if (!step || step.state === "done" || inFlight.has(step.id)) return;
-		inFlight.add(step.id);
-		let successor: Step | undefined;
-		try {
-			const res = await fetch(`${EXECUTOR}/v1/execute`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ kind: step.kind, spec: step.spec, session: step.session }),
-			});
-			const body: any = await res.json().catch(() => ({}));
-			if (!res.ok) {
-				// Infra failure: nothing commits, step stays pending, callers may retry.
-				console.error(`[fakecar] ${step.id.slice(0, 12)} execute failed: ${body.error}`);
-				for (const waiter of step.waiters) waiter({ ...step, ok: false, payload: body.error });
-				step.waiters = [];
-				return;
-			}
-			successor = commit(step, true, body.result, body.next);
-		} catch (e: any) {
-			console.error(`[fakecar] ${step.id.slice(0, 12)} execute error: ${e?.message ?? e}`);
-			for (const waiter of step.waiters) waiter({ ...step, ok: false, payload: e?.message ?? String(e) });
-			step.waiters = [];
-			return;
-		} finally {
-			inFlight.delete(step.id);
-		}
-		current = successor?.id;
+function labelsMatch(requirements: Record<string, string>, labels: Record<string, string>): boolean {
+	return Object.entries(requirements).every(([key, value]) => labels[key] === value);
+}
+
+function findWork(worker: string, labels: Record<string, string>): Step | undefined {
+	let pending: Step | undefined;
+	for (const step of steps.values()) {
+		if (!labelsMatch(step.requirements, labels)) continue;
+		if (step.state === "claimed" && step.owner === worker) return step;
+		if (!pending && step.state === "pending") pending = step;
 	}
+	return pending;
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -97,13 +80,8 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 }
 
 function replyStep(res: http.ServerResponse, step: Step) {
-	if (step.ok) {
-		res.writeHead(200, { "content-type": "application/json" });
-		res.end(JSON.stringify({ result: step.payload }));
-	} else {
-		res.writeHead(502, { "content-type": "application/json" });
-		res.end(JSON.stringify({ error: step.payload }));
-	}
+	res.writeHead(200, { "content-type": "application/json" });
+	res.end(JSON.stringify({ result: step.payload }));
 }
 
 const server = http.createServer(async (req, res) => {
@@ -115,7 +93,64 @@ const server = http.createServer(async (req, res) => {
 	}
 	if (req.method === "GET" && url.pathname === "/v1/debug/stats") {
 		res.writeHead(200, { "content-type": "application/json" });
-		res.end(JSON.stringify({ steps: steps.size, blobs: blobs.size, sessions: order.size }));
+		res.end(JSON.stringify({ steps: steps.size, blobs: blobs.size, sessions: order.size, renewals }));
+		return;
+	}
+
+	// ---- pull workers ----
+	if (req.method === "POST" && url.pathname === "/v1/work/claim") {
+		try {
+			const { worker_id, labels = {} } = JSON.parse(await readBody(req));
+			if (typeof worker_id !== "string" || !worker_id) throw new Error("missing worker_id");
+			const step = findWork(worker_id, labels);
+			if (!step) {
+				res.writeHead(204).end();
+				return;
+			}
+			step.state = "claimed";
+			step.owner = worker_id;
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify({
+				step_id: step.id, session: step.session, kind: step.kind, spec: step.spec,
+				requirements: step.requirements, attempt: step.attempt,
+			}));
+		} catch (e: any) {
+			res.writeHead(400, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: `bad request: ${e?.message ?? e}` }));
+		}
+		return;
+	}
+	if (req.method === "POST" && url.pathname === "/v1/work/renew") {
+		try {
+			const { worker_id, step_id, attempt } = JSON.parse(await readBody(req));
+			const step = steps.get(step_id);
+			const renewed = step?.state === "claimed" && step.owner === worker_id && step.attempt === attempt;
+			res.writeHead(renewed ? 200 : 409, { "content-type": "application/json" });
+			res.end(JSON.stringify(renewed ? { renewed: true } : { renewed: false, reason: "fenced" }));
+			if (renewed) renewals++;
+		} catch (e: any) {
+			res.writeHead(400, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: `bad request: ${e?.message ?? e}` }));
+		}
+		return;
+	}
+	if (req.method === "POST" && url.pathname === "/v1/work/commit") {
+		try {
+			const { worker_id, step_id, attempt, result, next } = JSON.parse(await readBody(req));
+			const step = steps.get(step_id);
+			const accepted = step?.state === "claimed" && step.owner === worker_id && step.attempt === attempt;
+			if (!accepted) {
+				res.writeHead(409, { "content-type": "application/json" });
+				res.end(JSON.stringify({ committed: false, reason: "fenced" }));
+				return;
+			}
+			commit(step, result, next);
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify({ committed: true }));
+		} catch (e: any) {
+			res.writeHead(400, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: `bad request: ${e?.message ?? e}` }));
+		}
 		return;
 	}
 
@@ -170,7 +205,8 @@ const server = http.createServer(async (req, res) => {
 				kind: s.kind,
 				state: s.state,
 				spec: s.spec,
-				result: s.state === "done" && s.ok ? s.payload : undefined,
+				requirements: s.requirements,
+				result: s.state === "done" ? s.payload : undefined,
 			};
 		});
 		res.writeHead(200, { "content-type": "application/json" });
@@ -181,8 +217,9 @@ const server = http.createServer(async (req, res) => {
 	// ---- step submission ----
 	if (req.method === "POST" && url.pathname === "/v1/step") {
 		let step_id: string, session: string, kind: string, spec: any;
+		let requirements: Record<string, string>;
 		try {
-			({ step_id, session, kind, spec } = JSON.parse(await readBody(req)));
+			({ step_id, session, kind, spec, requirements = {} } = JSON.parse(await readBody(req)));
 			if (typeof step_id !== "string" || !step_id) throw new Error("missing step_id");
 			if (typeof session !== "string" || !session) throw new Error("missing session");
 			if (kind !== "llm" && kind !== "tool") throw new Error(`bad kind: ${kind}`);
@@ -193,13 +230,12 @@ const server = http.createServer(async (req, res) => {
 			return;
 		}
 
-		const step = submit(step_id, session, kind, spec);
+		const step = submit(step_id, session, kind, spec, requirements);
 		const wait = url.searchParams.get("wait") !== "false";
 
 		if (!wait) {
 			res.writeHead(202, { "content-type": "application/json" });
 			res.end(JSON.stringify({ step_id }));
-			void work(step_id); // turn advances with no client attached
 			return;
 		}
 		if (step.state === "done") {
@@ -207,7 +243,6 @@ const server = http.createServer(async (req, res) => {
 			return;
 		}
 		step.waiters.push((s) => replyStep(res, s));
-		void work(step_id);
 		return;
 	}
 
@@ -215,5 +250,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-	console.error(`[fakecar] listening on 127.0.0.1:${PORT} (executor ${EXECUTOR})`);
+	console.error(`[fakecar] listening on 127.0.0.1:${PORT}`);
 });

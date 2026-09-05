@@ -9,7 +9,6 @@ import os from "node:os";
 import path from "node:path";
 import { launch, waitHealthy, freePort, executorDir } from "./helpers.ts";
 
-const executorPort = freePort();
 const sidecarPort = freePort();
 const sidecarUrl = `http://127.0.0.1:${sidecarPort}`;
 const workDir = mkdtempSync(path.join(os.tmpdir(), "beignet-headless-"));
@@ -45,27 +44,27 @@ const script = [
 	assistant([{ type: "text", text: "HEADLESS_TURN_COMPLETE" }], "stop"),
 ];
 
-let executor: ReturnType<typeof launch>;
+let worker: ReturnType<typeof launch>;
 let fakecar: ReturnType<typeof launch>;
 
 before(async () => {
 	const scriptPath = path.join(workDir, "llm-script.json");
 	writeFileSync(scriptPath, JSON.stringify(script));
-	executor = launch("executor.ts", {
-		BEIGNET_EXECUTOR_PORT: String(executorPort),
-		BEIGNET_SIDECAR_URL: sidecarUrl,
-		BEIGNET_FAKE_LLM: scriptPath,
-	});
 	fakecar = launch("fakecar.ts", {
 		BEIGNET_SIDECAR_PORT: String(sidecarPort),
-		BEIGNET_EXECUTOR_URL: `http://127.0.0.1:${executorPort}`,
 	});
-	await waitHealthy(`http://127.0.0.1:${executorPort}`);
+	worker = launch("worker.ts", {
+		BEIGNET_SIDECAR_URL: sidecarUrl,
+		BEIGNET_FAKE_LLM: scriptPath,
+		BEIGNET_WORKER_ID: "headless-worker",
+		BEIGNET_WORKER_LABELS: JSON.stringify({ pool: "test" }),
+		BEIGNET_RENEW_INTERVAL_MS: "100",
+	});
 	await waitHealthy(sidecarUrl);
 });
 
 after(() => {
-	executor.kill("SIGKILL");
+	worker.kill("SIGKILL");
 	fakecar.kill("SIGKILL");
 });
 
@@ -125,6 +124,8 @@ test("a turn completes after the client exits", { timeout: 90_000 }, async () =>
 
 	// The final assistant message closed the turn.
 	assert.match(JSON.stringify(final.at(-1).result.content), /HEADLESS_TURN_COMPLETE/);
+	const stats = await (await fetch(`${sidecarUrl}/v1/debug/stats`)).json() as any;
+	assert.ok(stats.renewals > 0, "the worker renewed its lease during the slow tool");
 });
 
 test("context accumulates: the last llm step sees the whole turn", async () => {
@@ -163,4 +164,34 @@ test("a second turn inherits model, system prompt and tools from the first", asy
 		turn2.spec.context.messages.length > turn1.spec.context.messages.length,
 		"turn 2 carries turn 1's history",
 	);
+});
+
+test("worker claims only steps matching its labels", { timeout: 10_000 }, async () => {
+	const submit = async (step_id: string, requirement: string, output: string) => {
+		const res = await fetch(`${sidecarUrl}/v1/step?wait=false`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				step_id,
+				session: `${session}-labels`,
+				kind: "tool",
+				spec: { tool: "bash", args: { command: `echo ${output}` }, cwd: workDir },
+				requirements: { pool: requirement },
+			}),
+		});
+		assert.equal(res.status, 202);
+	};
+	await submit("label-mismatch", "other", "wrong");
+	await submit("label-match", "test", "right");
+
+	let listed: any[] = [];
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		listed = await fetch(`${sidecarUrl}/v1/session/${session}-labels/steps`)
+			.then((res) => res.json()).then((body: any) => body.steps);
+		if (listed.find((step) => step.step_id === "label-match")?.state === "done") break;
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
+	assert.equal(listed.find((step) => step.step_id === "label-mismatch")?.state, "pending");
+	assert.equal(listed.find((step) => step.step_id === "label-match")?.state, "done");
 });

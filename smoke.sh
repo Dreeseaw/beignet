@@ -4,15 +4,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-export BEIGNET_EXECUTOR_PORT=4701
 export BEIGNET_SIDECAR_PORT=4700
-export BEIGNET_EXECUTOR_URL="http://127.0.0.1:$BEIGNET_EXECUTOR_PORT"
 export BEIGNET_SIDECAR_URL="http://127.0.0.1:$BEIGNET_SIDECAR_PORT"
 MODEL="${1:-anthropic/claude-haiku-4-5}"
 
-node executor/executor.ts & EXEC_PID=$!
 node executor/fakecar.ts & CAR_PID=$!
-trap 'kill $EXEC_PID $CAR_PID 2>/dev/null || true' EXIT
+node executor/worker.ts & WORKER_PID=$!
+trap 'kill $WORKER_PID $CAR_PID 2>/dev/null || true' EXIT
 sleep 1
 
 workdir="$(mktemp -d)"

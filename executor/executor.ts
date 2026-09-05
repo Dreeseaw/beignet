@@ -3,6 +3,7 @@
 // here (providers, tools, turn chaining); none live in Go.
 import http from "node:http";
 import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import {
 	createBashTool,
 	createFindTool,
@@ -31,7 +32,6 @@ const models = await ModelRuntime.create();
 const fakeLlm: any[] = process.env.BEIGNET_FAKE_LLM
 	? JSON.parse(readFileSync(process.env.BEIGNET_FAKE_LLM, "utf8"))
 	: [];
-let fakeIndex = 0;
 
 const toolFactories: Record<string, (cwd: string) => any> = {
 	bash: createBashTool,
@@ -45,7 +45,10 @@ async function runStep(kind: string, spec: any): Promise<any> {
 	if (kind === "llm") {
 		const { model, context: refs, options } = spec;
 		const context = await rebuildContext(refs, (hash) => blobs.get(hash));
-		if (fakeLlm.length > 0) return fakeLlm[fakeIndex++ % fakeLlm.length];
+		if (fakeLlm.length > 0) {
+			const priorReplies = context.messages.filter((message: any) => message?.role === "assistant").length;
+			return fakeLlm[priorReplies % fakeLlm.length];
+		}
 		// Prefer the node's configured model (correct baseUrl + auth wiring);
 		// the spec's embedded copy is the fallback for unknown providers.
 		const resolved = models.getModel(model.provider, model.id) ?? model;
@@ -73,6 +76,17 @@ async function runStep(kind: string, spec: any): Promise<any> {
 	throw new Error(`unknown step kind: ${kind}`);
 }
 
+export async function executeStep(kind: string, spec: any, session = "") {
+	const result = await runStep(kind, spec);
+	// Referenced blobs land before the control plane can commit the successor.
+	const next = await computeNext(session, kind, spec, result, blobs);
+	console.error(
+		`[executor] ${kind}${kind === "tool" ? `:${spec.tool}` : ""} ok` +
+			(next ? ` → next ${next.kind} ${next.step_id.slice(0, 12)}` : " → turn end"),
+	);
+	return next ? { result, next } : { result };
+}
+
 function readBody(req: http.IncomingMessage): Promise<string> {
 	return new Promise((resolve, reject) => {
 		let data = "";
@@ -90,16 +104,9 @@ const server = http.createServer(async (req, res) => {
 	if (req.method === "POST" && req.url === "/v1/execute") {
 		try {
 			const { kind, spec, session } = JSON.parse(await readBody(req));
-			const result = await runStep(kind, spec);
-			// Blobs `next` references are uploaded inside computeNext, before we
-			// answer — so the sidecar's commit can never reference missing data.
-			const next = await computeNext(session ?? "", kind, spec, result, blobs);
-			console.error(
-				`[executor] ${kind}${kind === "tool" ? `:${spec.tool}` : ""} ok` +
-					(next ? ` → next ${next.kind} ${next.step_id.slice(0, 12)}` : " → turn end"),
-			);
+			const output = await executeStep(kind, spec, session);
 			res.writeHead(200, { "content-type": "application/json" });
-			res.end(JSON.stringify(next ? { result, next } : { result }));
+			res.end(JSON.stringify(output));
 		} catch (e: any) {
 			console.error(`[executor] error: ${e?.message ?? e}`);
 			res.writeHead(500, { "content-type": "application/json" });
@@ -110,6 +117,8 @@ const server = http.createServer(async (req, res) => {
 	res.writeHead(404).end();
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-	console.error(`[executor] listening on 127.0.0.1:${PORT} (sidecar ${SIDECAR})`);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+	server.listen(PORT, "127.0.0.1", () => {
+		console.error(`[executor] listening on 127.0.0.1:${PORT} (sidecar ${SIDECAR})`);
+	});
+}
