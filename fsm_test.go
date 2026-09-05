@@ -204,18 +204,21 @@ func TestDoneStepIsNotClaimable(t *testing.T) {
 
 func TestPutBlobIsIdempotent(t *testing.T) {
 	fsm := newFSM()
-	apply(t, fsm, OpPutBlob, PutBlobOp{Key: "h1", Value: []byte("hello")})
-	apply(t, fsm, OpPutBlob, PutBlobOp{Key: "h1", Value: []byte("hello")})
+	hash := artifactHash([]byte("hello"))
+	apply(t, fsm, OpPutBlob, PutBlobOp{Hash: hash, Size: 5})
+	apply(t, fsm, OpPutBlob, PutBlobOp{Hash: hash, Size: 99})
 
-	v, ok := fsm.blobs.Load("h1")
-	if !ok || string(v.([]byte)) != "hello" {
-		t.Errorf("blob = %v, want hello", v)
+	v, ok := fsm.blobs.Load(hash)
+	if !ok || v.(ArtifactMeta).Size != 5 {
+		t.Errorf("blob metadata = %v, want size 5", v)
 	}
 }
 
 func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 	fsm := newFSM()
-	apply(t, fsm, OpPutBlob, PutBlobOp{Key: "h1", Value: []byte("hello")})
+	hash := artifactHash([]byte("hello"))
+	laterHash := artifactHash([]byte("after snapshot"))
+	apply(t, fsm, OpPutBlob, PutBlobOp{Hash: hash, Size: 5})
 	apply(t, fsm, OpSetNode, SetNodeOp{NodeID: "node1", HTTPAddr: "127.0.0.1:4700"})
 	submit(t, fsm, "s1", "sess")
 	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
@@ -234,7 +237,7 @@ func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	apply(t, fsm, OpPutBlob, PutBlobOp{Key: "later", Value: []byte("after snapshot")})
+	apply(t, fsm, OpPutBlob, PutBlobOp{Hash: laterHash, Size: 15})
 
 	sink := &memorySnapshotSink{}
 	if err := snapshotBeforeMutation.Persist(sink); err != nil {
@@ -251,10 +254,10 @@ func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 	if restored.tick != 7 || restored.seq != 2 {
 		t.Fatalf("restored counters: tick=%d seq=%d, want 7 and 2", restored.tick, restored.seq)
 	}
-	if v, ok := restored.blobs.Load("h1"); !ok || string(v.([]byte)) != "hello" {
+	if v, ok := restored.blobs.Load(hash); !ok || v.(ArtifactMeta).Size != 5 {
 		t.Fatalf("restored blob = %q, present=%v", v, ok)
 	}
-	if _, ok := restored.blobs.Load("later"); ok {
+	if _, ok := restored.blobs.Load(laterHash); ok {
 		t.Fatal("snapshot included a mutation made after Snapshot returned")
 	}
 	if v, ok := restored.nodes.Load("node1"); !ok || v.(string) != "127.0.0.1:4700" {

@@ -6,9 +6,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -202,39 +201,46 @@ func (h *HTTPServer) hashGetHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	hashID := r.PathValue("hash")
 
-	val, found := h.blobs.Load(hashID)
+	_, found := h.blobs.Load(hashID)
 	if !found {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	if b, ok := val.([]byte); ok {
-		w.Write(b)
-	} else {
-		w.WriteHeader(http.StatusInternalServerError)
+	b, err := h.artifactStore.Get(r.Context(), hashID)
+	if errors.Is(err, ErrArtifactNotFound) {
+		writeErr(w, http.StatusInternalServerError, "artifact metadata exists but bytes are missing")
+		return
 	}
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	w.Write(b)
 }
+
+const maxArtifactBytes = 64 << 20
 
 func (h *HTTPServer) hashSetHandler(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	hashID := r.PathValue("hash")
-	bodyBytes, _ := io.ReadAll(r.Body)
-	bodyHash := sha256.Sum256(bodyBytes)
-
-	// Verify if they match
-	if hex.EncodeToString(bodyHash[:]) != hashID {
+	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxArtifactBytes))
+	if err != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, "artifact exceeds 64 MiB or could not be read")
+		return
+	}
+	if err := verifyArtifact(hashID, bodyBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "hash mismatch")
 		return
 	}
 
-	// Verify idempotence
-	_, found := h.blobs.Load(hashID)
-	if found {
-		w.WriteHeader(http.StatusOK)
+	// Bytes must be durable before Raft publishes a reference to them. A crash
+	// between these operations can leave an unreferenced object, never a dangling
+	// committed reference.
+	if err := h.artifactStore.Put(r.Context(), hashID, bodyBytes); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-
-	// Apply to FSM
-	if _, err := h.applyOp(OpPutBlob, PutBlobOp{Key: hashID, Value: bodyBytes}); err != nil {
+	if _, err := h.applyOp(OpPutBlob, PutBlobOp{Hash: hashID, Size: int64(len(bodyBytes))}); err != nil {
 		writeErr(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}

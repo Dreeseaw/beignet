@@ -14,7 +14,7 @@ import (
 
 // The whole ledger: two maps and two counters.
 //
-//	blobs — content-addressed bytes, no lifecycle
+//	blobs — content-addressed artifact metadata, no lifecycle
 //	steps — little state machines that claim, commit and expire themselves
 //	tick  — ledger time (NEVER a wall clock: advances only via Tick entries,
 //	        so every replica computes lease expiry identically and clock skew
@@ -54,6 +54,11 @@ type Step struct {
 	Attempt   int             `json:"attempt"`
 	Seq       uint64          `json:"seq"`
 	Result    json.RawMessage `json:"result,omitempty"`
+}
+
+type ArtifactMeta struct {
+	Hash string `json:"hash"`
+	Size int64  `json:"size"`
 }
 
 // A step owns its own lifecycle. These three rules are the entire distributed
@@ -113,8 +118,8 @@ type SetNodeOp struct {
 }
 
 type PutBlobOp struct {
-	Key   string `json:"key"`
-	Value []byte `json:"value"`
+	Hash string `json:"hash"`
+	Size int64  `json:"size"`
 }
 
 type SubmitStepOp struct {
@@ -202,7 +207,12 @@ func (fsm *FSM) coreApply(p *Payload) any {
 		if err := json.Unmarshal(p.Data, &op); err != nil {
 			return fmt.Errorf("invalid PutBlob data: %w", err)
 		}
-		fsm.blobs.Store(op.Key, op.Value)
+		if !validArtifactHash(op.Hash) || op.Size < 0 {
+			return fmt.Errorf("invalid artifact metadata")
+		}
+		if _, exists := fsm.blobs.Load(op.Hash); !exists {
+			fsm.blobs.Store(op.Hash, ArtifactMeta{Hash: op.Hash, Size: op.Size})
+		}
 
 	case OpSubmitStep:
 		// on raft apply, each node should trigger a worker chan to asyncly
@@ -299,15 +309,15 @@ func (fsm *FSM) Apply(entry *raft.Log) any {
 	return fsm.CoreApply(&p)
 }
 
-const snapshotVersion = 1
+const snapshotVersion = 2
 
 type persistedState struct {
-	Version int               `json:"version"`
-	Blobs   map[string][]byte `json:"blobs"`
-	Steps   map[string]Step   `json:"steps"`
-	Nodes   map[string]string `json:"nodes"`
-	Tick    uint64            `json:"tick"`
-	Seq     uint64            `json:"seq"`
+	Version int                     `json:"version"`
+	Blobs   map[string]ArtifactMeta `json:"blobs"`
+	Steps   map[string]Step         `json:"steps"`
+	Nodes   map[string]string       `json:"nodes"`
+	Tick    uint64                  `json:"tick"`
+	Seq     uint64                  `json:"seq"`
 }
 
 type snapshot struct {
@@ -320,14 +330,14 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 
 	state := persistedState{
 		Version: snapshotVersion,
-		Blobs:   make(map[string][]byte),
+		Blobs:   make(map[string]ArtifactMeta),
 		Steps:   make(map[string]Step),
 		Nodes:   make(map[string]string),
 		Tick:    f.tick,
 		Seq:     f.seq,
 	}
 	f.blobs.Range(func(k, v any) bool {
-		state.Blobs[k.(string)] = append([]byte(nil), v.([]byte)...)
+		state.Blobs[k.(string)] = v.(ArtifactMeta)
 		return true
 	})
 	f.steps.Range(func(k, v any) bool {
@@ -372,7 +382,7 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 		clearSyncMap(f.nodes)
 	}
 	for k, v := range state.Blobs {
-		f.blobs.Store(k, append([]byte(nil), v...))
+		f.blobs.Store(k, v)
 	}
 	for k, step := range state.Steps {
 		step.Spec = append(json.RawMessage(nil), step.Spec...)
