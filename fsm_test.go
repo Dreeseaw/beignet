@@ -76,8 +76,8 @@ func TestClaimIsFirstWriterWins(t *testing.T) {
 	fsm := newFSM()
 	submit(t, fsm, "s1", "sess")
 
-	first := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
-	second := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node2"}).(ClaimVerdict)
+	first := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "worker1"}).(ClaimVerdict)
+	second := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "worker2"}).(ClaimVerdict)
 
 	if !first.Won {
 		t.Error("first claim should win")
@@ -85,23 +85,31 @@ func TestClaimIsFirstWriterWins(t *testing.T) {
 	if second.Won {
 		t.Error("second claim should lose: the step is already owned")
 	}
-	if owner := step(t, fsm, "s1").Owner; owner != "node1" {
-		t.Errorf("owner = %q, want node1", owner)
+	if owner := step(t, fsm, "s1").Owner; owner != "worker1" {
+		t.Errorf("owner = %q, want worker1", owner)
 	}
 }
 
-func TestReclaimByOwnerRenewsLease(t *testing.T) {
+func TestRenewRequiresTheCurrentWorkerAndAttempt(t *testing.T) {
 	fsm := newFSM()
 	submit(t, fsm, "s1", "sess")
-	apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"})
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "worker1"}).(ClaimVerdict)
 
 	for i := 0; i < 5; i++ {
 		apply(t, fsm, OpTick, struct{}{})
 	}
-	again := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
+	wrong := apply(t, fsm, OpRenewStep, RenewStepOp{
+		StepID: "s1", WorkerID: "worker1", Attempt: claim.Attempt + 1,
+	}).(RenewVerdict)
+	if wrong.Renewed {
+		t.Fatal("a stale attempt renewed the claim")
+	}
+	again := apply(t, fsm, OpRenewStep, RenewStepOp{
+		StepID: "s1", WorkerID: "worker1", Attempt: claim.Attempt,
+	}).(RenewVerdict)
 
-	if !again.Won {
-		t.Fatal("owner must be able to re-claim (that's how leases renew)")
+	if !again.Renewed {
+		t.Fatal("current worker and attempt must renew")
 	}
 	if got := step(t, fsm, "s1").ClaimTick; got != fsm.tick {
 		t.Errorf("ClaimTick = %d, want %d (renewal must refresh it)", got, fsm.tick)
@@ -111,7 +119,7 @@ func TestReclaimByOwnerRenewsLease(t *testing.T) {
 func TestLeaseExpiryReleasesAndFences(t *testing.T) {
 	fsm := newFSM()
 	submit(t, fsm, "s1", "sess")
-	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "dead"}).(ClaimVerdict)
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "dead"}).(ClaimVerdict)
 
 	for i := uint64(0); i <= leaseTicks+1; i++ {
 		apply(t, fsm, OpTick, struct{}{})
@@ -127,7 +135,7 @@ func TestLeaseExpiryReleasesAndFences(t *testing.T) {
 
 	// The presumed-dead node comes back and tries to commit its stale work.
 	zombie := apply(t, fsm, OpCommitResult, CommitResultOp{
-		StepID: "s1", NodeID: "dead", Attempt: claim.Attempt, Result: json.RawMessage(`{"stale":true}`),
+		StepID: "s1", WorkerID: "dead", Attempt: claim.Attempt, Result: json.RawMessage(`{"stale":true}`),
 	}).(CommitVerdict)
 	if zombie.Committed {
 		t.Error("zombie commit must be fenced")
@@ -137,7 +145,7 @@ func TestLeaseExpiryReleasesAndFences(t *testing.T) {
 	}
 
 	// And a live node can take over.
-	retake := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "alive"}).(ClaimVerdict)
+	retake := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "alive"}).(ClaimVerdict)
 	if !retake.Won {
 		t.Error("released step must be claimable by another node")
 	}
@@ -145,14 +153,17 @@ func TestLeaseExpiryReleasesAndFences(t *testing.T) {
 
 func TestCommitStoresResultAndChainsNextAtomically(t *testing.T) {
 	fsm := newFSM()
-	submit(t, fsm, "s1", "sess")
-	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
+	apply(t, fsm, OpSubmitStep, SubmitStepOp{
+		StepID: "s1", Session: "sess", Kind: "tool", Spec: json.RawMessage(`{"tool":"bash"}`),
+		Requirements: map[string]string{"pool": "gpu"},
+	})
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "worker1"}).(ClaimVerdict)
 
 	verdict := apply(t, fsm, OpCommitResult, CommitResultOp{
-		StepID:  "s1",
-		NodeID:  "node1",
-		Attempt: claim.Attempt,
-		Result:  json.RawMessage(`{"content":"ok"}`),
+		StepID:   "s1",
+		WorkerID: "worker1",
+		Attempt:  claim.Attempt,
+		Result:   json.RawMessage(`{"content":"ok"}`),
 		Next: &NextStep{
 			StepID: "s2", Session: "sess", Kind: "llm", Spec: json.RawMessage(`{"model":"m"}`),
 		},
@@ -169,6 +180,9 @@ func TestCommitStoresResultAndChainsNextAtomically(t *testing.T) {
 	if next.State != StatePending || next.Kind != "llm" {
 		t.Errorf("successor not inserted as pending llm: %+v", next)
 	}
+	if next.Requirements["pool"] != "gpu" {
+		t.Errorf("successor requirements = %v, want inherited pool=gpu", next.Requirements)
+	}
 	if next.Seq <= done.Seq {
 		t.Error("successor must sort after its predecessor")
 	}
@@ -177,8 +191,8 @@ func TestCommitStoresResultAndChainsNextAtomically(t *testing.T) {
 func TestCommitTwiceIsDuplicate(t *testing.T) {
 	fsm := newFSM()
 	submit(t, fsm, "s1", "sess")
-	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
-	op := CommitResultOp{StepID: "s1", NodeID: "node1", Attempt: claim.Attempt, Result: json.RawMessage(`1`)}
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "worker1"}).(ClaimVerdict)
+	op := CommitResultOp{StepID: "s1", WorkerID: "worker1", Attempt: claim.Attempt, Result: json.RawMessage(`1`)}
 
 	apply(t, fsm, OpCommitResult, op)
 	second := apply(t, fsm, OpCommitResult, op).(CommitVerdict)
@@ -191,12 +205,12 @@ func TestCommitTwiceIsDuplicate(t *testing.T) {
 func TestDoneStepIsNotClaimable(t *testing.T) {
 	fsm := newFSM()
 	submit(t, fsm, "s1", "sess")
-	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "worker1"}).(ClaimVerdict)
 	apply(t, fsm, OpCommitResult, CommitResultOp{
-		StepID: "s1", NodeID: "node1", Attempt: claim.Attempt, Result: json.RawMessage(`1`),
+		StepID: "s1", WorkerID: "worker1", Attempt: claim.Attempt, Result: json.RawMessage(`1`),
 	})
 
-	again := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node2"}).(ClaimVerdict)
+	again := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "worker2"}).(ClaimVerdict)
 	if again.Won {
 		t.Error("a finished step must never be re-claimed")
 	}
@@ -220,13 +234,16 @@ func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 	laterHash := artifactHash([]byte("after snapshot"))
 	apply(t, fsm, OpPutBlob, PutBlobOp{Hash: hash, Size: 5})
 	apply(t, fsm, OpSetNode, SetNodeOp{NodeID: "node1", HTTPAddr: "127.0.0.1:4700"})
-	submit(t, fsm, "s1", "sess")
-	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", NodeID: "node1"}).(ClaimVerdict)
+	apply(t, fsm, OpSubmitStep, SubmitStepOp{
+		StepID: "s1", Session: "sess", Kind: "tool", Spec: json.RawMessage(`{"tool":"bash"}`),
+		Requirements: map[string]string{"pool": "gpu"},
+	})
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "worker1"}).(ClaimVerdict)
 	for i := 0; i < 7; i++ {
 		apply(t, fsm, OpTick, struct{}{})
 	}
 	apply(t, fsm, OpCommitResult, CommitResultOp{
-		StepID: "s1", NodeID: "node1", Attempt: claim.Attempt,
+		StepID: "s1", WorkerID: "worker1", Attempt: claim.Attempt,
 		Result: json.RawMessage(`{"content":"ok"}`),
 		Next: &NextStep{
 			StepID: "s2", Session: "sess", Kind: "llm", Spec: json.RawMessage(`{"model":"m"}`),
@@ -266,7 +283,7 @@ func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 	if got := step(t, restored, "s1"); got.State != StateDone || string(got.Result) != `{"content":"ok"}` {
 		t.Fatalf("restored completed step = %+v", got)
 	}
-	if got := step(t, restored, "s2"); got.State != StatePending || got.Seq != 2 {
+	if got := step(t, restored, "s2"); got.State != StatePending || got.Seq != 2 || got.Requirements["pool"] != "gpu" {
 		t.Fatalf("restored successor = %+v", got)
 	}
 }

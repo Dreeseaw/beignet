@@ -67,7 +67,7 @@ func (h *HTTPServer) claimLoop() {
 }
 
 func (h *HTTPServer) runStep(stepID string) {
-	verdict, err := h.applyOp(OpClaimStep, ClaimStepOp{StepID: stepID, NodeID: h.nodeID})
+	verdict, err := h.applyOp(OpClaimStep, ClaimStepOp{StepID: stepID, WorkerID: h.nodeID})
 	if err != nil {
 		log.Printf("claim %s failed: %v", short(stepID), err)
 		return
@@ -95,7 +95,7 @@ func (h *HTTPServer) runStep(stepID string) {
 			case <-stopRenew:
 				return
 			case <-time.After(renewInterval):
-				h.applyOp(OpClaimStep, ClaimStepOp{StepID: step.ID, NodeID: h.nodeID})
+				h.applyOp(OpClaimStep, ClaimStepOp{StepID: step.ID, WorkerID: h.nodeID})
 			}
 		}
 	}()
@@ -112,11 +112,11 @@ func (h *HTTPServer) runStep(stepID string) {
 	h.execErr.Delete(step.ID)
 
 	cv, err := h.applyOp(OpCommitResult, CommitResultOp{
-		StepID:  step.ID,
-		NodeID:  h.nodeID,
-		Attempt: v.Attempt,
-		Result:  res.Result,
-		Next:    res.Next,
+		StepID:   step.ID,
+		WorkerID: h.nodeID,
+		Attempt:  v.Attempt,
+		Result:   res.Result,
+		Next:     res.Next,
 	})
 	if err != nil {
 		log.Printf("x commit %s failed: %v", short(step.ID), err)
