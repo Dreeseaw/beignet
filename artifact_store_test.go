@@ -5,9 +5,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 func artifactHash(data []byte) string {
@@ -90,4 +96,35 @@ func TestS3ArtifactStoreContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	testArtifactStoreContract(t, store)
+}
+
+func TestS3ArtifactStoreClassifiesOnlyMissingKeysAsNotFound(t *testing.T) {
+	for _, test := range []struct {
+		code         string
+		wantNotFound bool
+	}{
+		{code: "NoSuchKey", wantNotFound: true},
+		{code: "NoSuchBucket", wantNotFound: false},
+	} {
+		t.Run(test.code, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusNotFound)
+				fmt.Fprintf(w, "<Error><Code>%s</Code><Message>not found</Message></Error>", test.code)
+			}))
+			defer server.Close()
+
+			client := s3.New(s3.Options{
+				BaseEndpoint: aws.String(server.URL),
+				Region:       "us-east-1",
+				Credentials:  aws.AnonymousCredentials{},
+				UsePathStyle: true,
+			})
+			store := &S3ArtifactStore{client: client, bucket: "bucket"}
+			_, err := store.Get(context.Background(), artifactHash([]byte("missing")))
+			if got := errors.Is(err, ErrArtifactNotFound); got != test.wantNotFound {
+				t.Fatalf("errors.Is(%v, ErrArtifactNotFound) = %v, want %v", err, got, test.wantNotFound)
+			}
+		})
+	}
 }

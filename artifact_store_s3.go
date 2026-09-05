@@ -6,14 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"path"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/aws/smithy-go"
 )
 
 type S3ArtifactStoreOptions struct {
@@ -94,8 +93,8 @@ func (s *S3ArtifactStore) Get(ctx context.Context, hash string) ([]byte, error) 
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		var responseErr *smithyhttp.ResponseError
-		if errors.As(err, &responseErr) && responseErr.HTTPStatusCode() == http.StatusNotFound {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && strings.EqualFold(apiErr.ErrorCode(), "NoSuchKey") {
 			return nil, ErrArtifactNotFound
 		}
 		return nil, fmt.Errorf("get S3 artifact: %w", err)
