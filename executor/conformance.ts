@@ -182,6 +182,20 @@ let claim: any;
 	});
 	check("successor result commits", finish.status === 200 && finish.json?.committed === true,
 		`HTTP ${finish.status}: ${finish.text}`);
+
+	const competing = await post("/v1/work/claim", {
+		worker_id: "worker-c", labels: { pool: "gpu", zone: "test" },
+	});
+	check("competing probe step is drained",
+		competing.status === 200 && competing.json?.step_id === competingID,
+		`HTTP ${competing.status}: ${competing.text}`);
+	const competingFinish = await post("/v1/work/commit", {
+		worker_id: "worker-c", step_id: competingID, attempt: competing.json?.attempt,
+		result: { stopReason: "probe complete" },
+	});
+	check("competing probe result commits",
+		competingFinish.status === 200 && competingFinish.json?.committed === true,
+		`HTTP ${competingFinish.status}: ${competingFinish.text}`);
 }
 
 // Session reads expose committed history in insertion order.
