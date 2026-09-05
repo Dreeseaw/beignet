@@ -22,11 +22,9 @@ type HTTPServer struct {
 	blobs         *sync.Map // hash -> ArtifactMeta; immutable bytes live in artifactStore
 	steps         *sync.Map
 	nodes         *sync.Map
-	execErr       *sync.Map // node-local: stepID -> last executor failure (not replicated)
 	artifactStore ArtifactStore
 	nodeID        string
 	httpAddr      string
-	execAddr      string
 }
 
 func main() {
@@ -34,7 +32,6 @@ func main() {
 	// Setup command-line options
 	nodeID := flag.String("id", "node1", "Unique node identifier")
 	httpAddr := flag.String("http", "127.0.0.1:4700", "HTTP server address")
-	execAddr := flag.String("executor", "http://127.0.0.1:4701", "Local executor base URL")
 	raftAddr := flag.String("raft", "127.0.0.1:7000", "Raft comms address")
 	joinAddr := flag.String("join", "", "HTTP address of the existing leader to join (leave blank for node1)")
 	artifactBackend := flag.String("artifact-store", "fs", "Artifact store backend: fs or s3")
@@ -130,11 +127,9 @@ func main() {
 		blobs:         blobs,
 		steps:         steps,
 		nodes:         nodes,
-		execErr:       &sync.Map{},
 		artifactStore: artifactStore,
 		nodeID:        *nodeID,
 		httpAddr:      *httpAddr,
-		execAddr:      *execAddr,
 	}
 	http.HandleFunc("GET /join", srv.joinHandler)
 	http.HandleFunc("GET /healthz", srv.healthzHandler)
@@ -142,6 +137,9 @@ func main() {
 	http.HandleFunc("GET /v1/status", srv.statusHandler)
 
 	http.HandleFunc("POST /v1/step", srv.stepHandler)
+	http.HandleFunc("POST /v1/work/claim", srv.workClaimHandler)
+	http.HandleFunc("POST /v1/work/renew", srv.workRenewHandler)
+	http.HandleFunc("POST /v1/work/commit", srv.workCommitHandler)
 
 	// Blob storage interface
 	http.HandleFunc("GET /v1/blob/{hash}", srv.hashGetHandler)
@@ -154,8 +152,6 @@ func main() {
 	// Node-to-node: followers forward writes here
 	http.HandleFunc("POST /v1/internal/apply", srv.internalApplyHandler)
 
-	// Claim + execute loop: sweeps the replicated steps map for pending work.
-	go srv.claimLoop()
 	go srv.tickLoop()
 	go srv.registerSelf()
 

@@ -75,6 +75,10 @@ func (h *HTTPServer) forward(t OpType, op []byte) (any, error) {
 		var v ClaimVerdict
 		json.Unmarshal(raw, &v)
 		return v, nil
+	case OpRenewStep:
+		var v RenewVerdict
+		json.Unmarshal(raw, &v)
+		return v, nil
 	case OpCommitResult:
 		var v CommitVerdict
 		json.Unmarshal(raw, &v)
@@ -110,10 +114,11 @@ func (h *HTTPServer) internalApplyHandler(w http.ResponseWriter, r *http.Request
 // ------------
 
 type StepRequest struct {
-	StepID  string          `json:"step_id"`
-	Session string          `json:"session"`
-	Kind    string          `json:"kind"`
-	Spec    json.RawMessage `json:"spec"` // an object, not base64 bytes
+	StepID       string            `json:"step_id"`
+	Session      string            `json:"session"`
+	Kind         string            `json:"kind"`
+	Spec         json.RawMessage   `json:"spec"` // an object, not base64 bytes
+	Requirements map[string]string `json:"requirements,omitempty"`
 }
 
 type StepResponse struct {
@@ -143,10 +148,11 @@ func (h *HTTPServer) stepHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Put SubmitStep{step_id} on ledger
 	if _, err := h.applyOp(OpSubmitStep, SubmitStepOp{
-		StepID:  sr.StepID,
-		Session: sr.Session,
-		Kind:    sr.Kind,
-		Spec:    sr.Spec,
+		StepID:       sr.StepID,
+		Session:      sr.Session,
+		Kind:         sr.Kind,
+		Spec:         sr.Spec,
+		Requirements: sr.Requirements,
 	}); err != nil {
 		writeErr(w, http.StatusServiceUnavailable, err.Error())
 		return
@@ -173,17 +179,13 @@ func (h *HTTPServer) stepHandler(w http.ResponseWriter, r *http.Request) {
 
 const pollInterval = 25 * time.Millisecond
 
-// waitForDone blocks until the step commits, the caller goes away, or the
-// local executor reports an infra failure (which commits nothing).
+// waitForDone blocks until the step commits or the caller goes away.
 func (h *HTTPServer) waitForDone(ctx context.Context, stepID string) (Step, error) {
 	for {
 		if v, ok := h.steps.Load(stepID); ok {
 			if step := v.(Step); step.State == StateDone {
 				return step, nil
 			}
-		}
-		if v, ok := h.execErr.Load(stepID); ok {
-			return Step{}, fmt.Errorf("%v", v)
 		}
 		select {
 		case <-ctx.Done():
@@ -283,12 +285,13 @@ func (h *HTTPServer) hashMissingHandler(w http.ResponseWriter, r *http.Request) 
 
 // GET /v1/session/{session}/steps?since=N — the watch route. Ordered, local.
 type sessionStep struct {
-	Index  int             `json:"index"`
-	StepID string          `json:"step_id"`
-	Kind   string          `json:"kind"`
-	State  StepState       `json:"state"`
-	Spec   json.RawMessage `json:"spec"`
-	Result json.RawMessage `json:"result,omitempty"`
+	Index        int               `json:"index"`
+	StepID       string            `json:"step_id"`
+	Kind         string            `json:"kind"`
+	State        StepState         `json:"state"`
+	Spec         json.RawMessage   `json:"spec"`
+	Requirements map[string]string `json:"requirements,omitempty"`
+	Result       json.RawMessage   `json:"result,omitempty"`
 }
 
 func (h *HTTPServer) sessionStepsHandler(w http.ResponseWriter, r *http.Request) {
@@ -315,12 +318,13 @@ func (h *HTTPServer) sessionStepsHandler(w http.ResponseWriter, r *http.Request)
 	out := make([]sessionStep, 0, len(found))
 	for i := since; i < len(found); i++ {
 		out = append(out, sessionStep{
-			Index:  i,
-			StepID: found[i].ID,
-			Kind:   found[i].Kind,
-			State:  found[i].State,
-			Spec:   found[i].Spec,
-			Result: found[i].Result,
+			Index:        i,
+			StepID:       found[i].ID,
+			Kind:         found[i].Kind,
+			State:        found[i].State,
+			Spec:         found[i].Spec,
+			Requirements: found[i].Requirements,
+			Result:       found[i].Result,
 		})
 	}
 	json.NewEncoder(w).Encode(map[string]any{"steps": out})
