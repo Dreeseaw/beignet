@@ -34,9 +34,13 @@ test("an expired worker attempt cannot overwrite its replacement", { timeout: 30
 	const sidecar = `http://127.0.0.1:${httpPort}`;
 	const children: ChildProcess[] = [];
 	let workerA: ChildProcess | undefined;
+	let workerB: ChildProcess | undefined;
 
 	t.after(() => {
-		if (workerA?.pid) process.kill(workerA.pid, "SIGCONT");
+		for (const worker of [workerA, workerB]) {
+			if (!worker?.pid) continue;
+			try { process.kill(worker.pid, "SIGCONT"); } catch {}
+		}
 		for (const child of children) child.kill("SIGKILL");
 		rmSync(runDir, { recursive: true, force: true });
 	});
@@ -123,17 +127,40 @@ test("an expired worker attempt cannot overwrite its replacement", { timeout: 30
 	await waitFor("worker A's lease to expire", async () => (await readStep()).state === "pending");
 
 	const second = startWorker("worker-b");
+	workerB = second.child;
 	await waitFor("worker B to re-execute the step", () => executions().length === 2);
 	const [firstPID, secondPID] = executions().map((line) => line.slice("start:".length));
 	assert.notEqual(firstPID, secondPID, "the replacement execution must be distinct");
+	assert.match(second.log(), /claimed tool fenced-step attempt 1/);
+	assert.ok(workerB.pid);
+	process.kill(workerB.pid, "SIGSTOP");
+	await waitFor("worker B to enter the stopped state", () => {
+		return /^State:\s+T/m.test(readFileSync(`/proc/${workerB!.pid}/status`, "utf8"));
+	});
+
+	const staleCommit = await fetch(`${sidecar}/v1/work/commit`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			worker_id: "worker-a",
+			step_id: "fenced-step",
+			attempt: 0,
+			result: { content: [{ type: "text", text: `result:${firstPID}\n` }] },
+		}),
+	});
+	assert.equal(staleCommit.status, 409);
+	assert.deepEqual(await staleCommit.json(), { committed: false, reason: "fenced" });
+	assert.equal((await readStep()).state, "claimed", "stale commit changed attempt 1");
+
 	process.kill(workerA.pid, "SIGCONT");
+	await waitFor("worker A's stale commit to be fenced", () => /commit fenced/.test(first.log()));
+	assert.doesNotMatch(first.log(), /lease lost/);
+	assert.equal((await readStep()).state, "claimed", "worker A changed attempt 1");
+	process.kill(workerB.pid, "SIGCONT");
 
 	await waitFor("worker B's result to commit", async () => (await readStep()).state === "done");
 	const accepted = JSON.stringify((await readStep()).result);
 	assert.match(accepted, new RegExp(`result:${secondPID}\\\\n`), `accepted result was not worker B's: ${accepted}`);
 	assert.doesNotMatch(accepted, new RegExp(`result:${firstPID}\\\\n`));
-	await waitFor("worker A's stale commit to be fenced", () => /commit fenced/.test(first.log()));
-	assert.doesNotMatch(first.log(), /lease lost/);
-	assert.match(second.log(), /claimed tool fenced-step attempt 1/);
 	assert.doesNotMatch(serverLog(), /panic|fatal error/i);
 });
