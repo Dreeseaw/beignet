@@ -84,6 +84,7 @@ test("tool step chains to its sibling, then to the next llm step", async () => {
 	);
 	assert.equal(third?.kind, "llm", "last sibling chains to the next llm step");
 	assert.deepEqual(third?.spec.model, { id: "m" });
+	assert.equal(third?.spec.cwd, "/work", "the next model call keeps the turn's workspace");
 	assert.equal(third?.spec.context.systemPrompt, "h-sys");
 	assert.equal(third?.spec.context.tools, "h-tools");
 	assert.equal(
@@ -122,16 +123,10 @@ test("standalone tool step (no chain metadata) ends the chain", async () => {
 	assert.equal(next, null);
 });
 
-test("step ids are content-derived: identical specs collide, different ones don't", async () => {
+test("step ids identify logical invocations, not identical input content", async () => {
 	const { client } = stubBlobs();
 	const msg = assistant([{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "echo a" } }]);
 	const a = await computeNext("s1", "llm", llmSpec, msg, client);
 	const b = await computeNext("s1", "llm", llmSpec, msg, client);
-	assert.equal(a?.step_id, b?.step_id, "same work → same id → dedup absorbs re-execution");
-
-	const other = assistant([
-		{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "echo DIFFERENT" } },
-	]);
-	const c = await computeNext("s1", "llm", llmSpec, other, client);
-	assert.notEqual(a?.step_id, c?.step_id);
+	assert.notEqual(a?.step_id, b?.step_id, "two requested samples must remain independent");
 });

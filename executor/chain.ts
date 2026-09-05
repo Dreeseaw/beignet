@@ -6,7 +6,7 @@
 //   tool result, last sibling  -> next llm step (context grown by the
 //                                 assistant message + all tool results)
 //   llm result, stopReason stop/length/error -> null (turn over)
-import { hashOf, stepIdOf, type BlobClient } from "./blobs.ts";
+import { hashOf, newStepId, type BlobClient } from "./blobs.ts";
 
 export interface ContextRefs {
 	systemPrompt: string | null;
@@ -40,8 +40,13 @@ export interface StepRef {
 }
 
 /** Single builder so head-built and chain-built llm specs hash identically. */
-export function buildLlmSpec(model: any, context: ContextRefs, options: any = {}) {
-	return { model, context, options };
+export function buildLlmSpec(
+	model: any,
+	context: ContextRefs,
+	options: any = {},
+	cwd?: string,
+) {
+	return cwd === undefined ? { model, context, options } : { model, context, options, cwd };
 }
 
 export function buildToolSpec(chain: ChainMeta) {
@@ -56,7 +61,7 @@ export function buildToolSpec(chain: ChainMeta) {
 }
 
 function stepRef(session: string, kind: "llm" | "tool", spec: any): StepRef {
-	return { step_id: stepIdOf(kind, spec), session, kind, spec };
+	return { step_id: newStepId(), session, kind, spec };
 }
 
 function toolCallsOf(assistant: any): ToolCallSpec[] {
@@ -134,7 +139,7 @@ async function nextAfterTool(
 		...chain.context,
 		messages: [...chain.context.messages, chain.assistant, ...results],
 	};
-	return stepRef(session, "llm", buildLlmSpec(chain.model, context, chain.options));
+	return stepRef(session, "llm", buildLlmSpec(chain.model, context, chain.options, chain.cwd));
 }
 
 /** Head-side helper: hash a value and stage it for upload. */
