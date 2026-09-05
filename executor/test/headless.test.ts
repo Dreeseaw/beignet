@@ -88,6 +88,10 @@ async function steps(): Promise<any[]> {
 	return ((await res.json()) as any).steps ?? [];
 }
 
+async function stats(): Promise<any> {
+	return await (await fetch(`${sidecarUrl}/v1/debug/stats`)).json();
+}
+
 test("a turn completes after the client exits", { timeout: 90_000 }, async () => {
 	const head = await runHead(["start", "--session", session, "--cwd", workDir, "do the thing"]);
 	assert.equal(head.code, 0, `head failed: ${head.stderr}`);
@@ -124,8 +128,8 @@ test("a turn completes after the client exits", { timeout: 90_000 }, async () =>
 
 	// The final assistant message closed the turn.
 	assert.match(JSON.stringify(final.at(-1).result.content), /HEADLESS_TURN_COMPLETE/);
-	const stats = await (await fetch(`${sidecarUrl}/v1/debug/stats`)).json() as any;
-	assert.ok(stats.renewals > 0, "the worker renewed its lease during the slow tool");
+	const currentStats = await stats();
+	assert.ok(currentStats.renewals > 0, "the worker renewed its lease during the slow tool");
 });
 
 test("context accumulates: the last llm step sees the whole turn", async () => {
@@ -194,4 +198,58 @@ test("worker claims only steps matching its labels", { timeout: 10_000 }, async 
 	}
 	assert.equal(listed.find((step) => step.step_id === "label-mismatch")?.state, "pending");
 	assert.equal(listed.find((step) => step.step_id === "label-match")?.state, "done");
+});
+
+test("SIGTERM stops an active claim and its renewals", { timeout: 10_000 }, async () => {
+	const stepId = "shutdown-active-claim";
+	const submitted = await fetch(`${sidecarUrl}/v1/step?wait=false`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			step_id: stepId,
+			session: `${session}-shutdown`,
+			kind: "tool",
+			spec: { tool: "bash", args: { command: "sleep 8; echo should-not-commit" }, cwd: workDir },
+			requirements: { pool: "shutdown" },
+		}),
+	});
+	assert.equal(submitted.status, 202);
+
+	const before = (await stats()).renewals;
+	const stoppingWorker = launch("worker.ts", {
+		BEIGNET_SIDECAR_URL: sidecarUrl,
+		BEIGNET_WORKER_ID: "stopping-worker",
+		BEIGNET_WORKER_LABELS: JSON.stringify({ pool: "shutdown" }),
+		BEIGNET_RENEW_INTERVAL_MS: "20",
+	});
+	try {
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline && (await stats()).renewals < before + 2) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		assert.ok((await stats()).renewals >= before + 2, "worker never began renewing the active claim");
+
+		const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+			stoppingWorker.once("exit", (code, childSignal) => resolve({ code, signal: childSignal }));
+		});
+		stoppingWorker.kill("SIGTERM");
+		const result = await Promise.race([
+			exited,
+			new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error("worker did not exit after SIGTERM")), 1_000),
+			),
+		]);
+		assert.equal(result.code, 0);
+		assert.equal(result.signal, null);
+
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		const settled = (await stats()).renewals;
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		assert.equal((await stats()).renewals, settled, "renewals continued after shutdown");
+		const shutdownSteps = await fetch(`${sidecarUrl}/v1/session/${session}-shutdown/steps`)
+			.then((res) => res.json()).then((body: any) => body.steps);
+		assert.notEqual(shutdownSteps[0]?.state, "done", "shutdown execution committed a result");
+	} finally {
+		stoppingWorker.kill("SIGKILL");
+	}
 });
