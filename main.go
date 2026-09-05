@@ -123,6 +123,7 @@ func main() {
 
 	// Node-to-node: followers forward writes here
 	http.HandleFunc("POST /v1/internal/apply", srv.internalApplyHandler)
+	http.HandleFunc("GET /v1/internal/ready", srv.internalReadyHandler)
 
 	// Claim + execute loop: sweeps the replicated steps map for pending work.
 	go srv.claimLoop()
