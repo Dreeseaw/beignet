@@ -48,6 +48,9 @@ func TestAllNodesRegisterHTTPAddresses(t *testing.T) {
 
 	for _, n := range nodes {
 		n := n
+		waitFor(t, n.id+" can route writes to the leader", 10*time.Second, func() bool {
+			return ready(n.httpAddr)
+		})
 		waitFor(t, "cluster knows all 3 HTTP addresses via "+n.id, 20*time.Second, func() bool {
 			// Submitting a step to each node only works if that node can reach
 			// the leader, which requires the address map to be populated.

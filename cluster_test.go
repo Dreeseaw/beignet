@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 var binPath string
@@ -44,25 +47,35 @@ type node struct {
 	cmd      *exec.Cmd
 }
 
-func freeAddr(t *testing.T) string {
+func freeAddrs(t *testing.T, count int) []string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	listeners := make([]net.Listener, count)
+	for i := range listeners {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners[i] = l
 	}
-	defer l.Close()
-	return l.Addr().String()
+	addrs := make([]string, count)
+	for i, l := range listeners {
+		addrs[i] = l.Addr().String()
+		if err := l.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return addrs
 }
 
-func newNode(t *testing.T, id string) *node {
+func newNode(t *testing.T, id, httpAddr, raftAddr string) *node {
 	dir := filepath.Join(t.TempDir(), id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return &node{
 		id:       id,
-		httpAddr: freeAddr(t),
-		raftAddr: freeAddr(t),
+		httpAddr: httpAddr,
+		raftAddr: raftAddr,
 		dir:      dir, // node writes raft-data/<id> relative to cwd
 		logPath:  filepath.Join(dir, "node.log"),
 	}
@@ -122,13 +135,32 @@ func dumpLogsOnFailure(t *testing.T, nodes []*node) {
 
 // ---------- http helpers ----------
 
-func healthy(addr string) bool {
-	resp, err := http.Get("http://" + addr + "/healthz")
+func endpointOK(addr, path string) bool {
+	resp, err := http.Get("http://" + addr + path)
 	if err != nil {
 		return false
 	}
 	resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
+}
+
+func healthy(addr string) bool { return endpointOK(addr, "/healthz") }
+func ready(addr string) bool   { return endpointOK(addr, "/readyz") }
+
+func nodeStatus(addr string) (statusResponse, bool) {
+	resp, err := http.Get("http://" + addr + "/v1/status")
+	if err != nil {
+		return statusResponse{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return statusResponse{}, false
+	}
+	var status statusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return statusResponse{}, false
+	}
+	return status, true
 }
 
 func hashOf(payload string) string {
@@ -170,19 +202,16 @@ func waitFor(t *testing.T, desc string, timeout time.Duration, cond func() bool)
 	t.Fatalf("timed out after %s waiting for: %s", timeout, desc)
 }
 
-// findLeader probes with a unique blob PUT: only the leader can Apply it.
-// (A repeated payload would false-positive on followers via the local
-// idempotence check, so every probe is unique.)
+// A write probe cannot identify the leader because followers forward writes.
 func findLeader(t *testing.T, nodes []*node) *node {
 	t.Helper()
 	var leader *node
-	waitFor(t, "a node to accept writes (leader elected)", 20*time.Second, func() bool {
+	waitFor(t, "a Raft leader to be elected", 20*time.Second, func() bool {
 		for _, n := range nodes {
 			if n.cmd == nil {
 				continue
 			}
-			probe := fmt.Sprintf(`{"probe":"%s-%d"}`, n.id, time.Now().UnixNano())
-			if status, _ := putBlob(n.httpAddr, probe); status == http.StatusOK {
+			if status, ok := nodeStatus(n.httpAddr); ok && status.State == raft.Leader.String() {
 				leader = n
 				return true
 			}
@@ -195,7 +224,12 @@ func findLeader(t *testing.T, nodes []*node) *node {
 // startCluster boots node1, waits until it leads, then joins node2 and node3.
 func startCluster(t *testing.T) []*node {
 	t.Helper()
-	nodes := []*node{newNode(t, "node1"), newNode(t, "node2"), newNode(t, "node3")}
+	addrs := freeAddrs(t, 6)
+	nodes := []*node{
+		newNode(t, "node1", addrs[0], addrs[1]),
+		newNode(t, "node2", addrs[2], addrs[3]),
+		newNode(t, "node3", addrs[4], addrs[5]),
+	}
 	dumpLogsOnFailure(t, nodes)
 
 	nodes[0].start(t, "")

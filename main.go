@@ -108,6 +108,8 @@ func main() {
 	}
 	http.HandleFunc("GET /join", srv.joinHandler)
 	http.HandleFunc("GET /healthz", srv.healthzHandler)
+	http.HandleFunc("GET /readyz", srv.readyzHandler)
+	http.HandleFunc("GET /v1/status", srv.statusHandler)
 
 	http.HandleFunc("POST /v1/step", srv.stepHandler)
 

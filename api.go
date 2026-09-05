@@ -329,6 +329,45 @@ func (h *HTTPServer) healthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+type statusResponse struct {
+	NodeID         string `json:"node_id"`
+	State          string `json:"state"`
+	LeaderID       string `json:"leader_id,omitempty"`
+	LeaderRaftAddr string `json:"leader_raft_addr,omitempty"`
+	LeaderHTTPAddr string `json:"leader_http_addr,omitempty"`
+}
+
+func (h *HTTPServer) currentStatus() statusResponse {
+	leaderAddr, leaderID := h.raft.LeaderWithID()
+	status := statusResponse{
+		NodeID:         h.nodeID,
+		State:          h.raft.State().String(),
+		LeaderID:       string(leaderID),
+		LeaderRaftAddr: string(leaderAddr),
+	}
+	if leaderID != "" {
+		if v, ok := h.nodes.Load(string(leaderID)); ok {
+			status.LeaderHTTPAddr = v.(string)
+		}
+	}
+	return status
+}
+
+// Followers need the leader's HTTP address to route writes.
+func (h *HTTPServer) readyzHandler(w http.ResponseWriter, r *http.Request) {
+	status := h.currentStatus()
+	if status.LeaderID == "" || (h.raft.State() != raft.Leader && status.LeaderHTTPAddr == "") {
+		writeErr(w, http.StatusServiceUnavailable, "no routable leader")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *HTTPServer) statusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(h.currentStatus())
+}
+
 // Raft request-to-join handler for leader
 func (h *HTTPServer) joinHandler(w http.ResponseWriter, r *http.Request) {
 	if h.raft.State() != raft.Leader {
