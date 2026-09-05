@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -36,12 +37,33 @@ func main() {
 	execAddr := flag.String("executor", "http://127.0.0.1:4701", "Local executor base URL")
 	raftAddr := flag.String("raft", "127.0.0.1:7000", "Raft comms address")
 	joinAddr := flag.String("join", "", "HTTP address of the existing leader to join (leave blank for node1)")
+	artifactBackend := flag.String("artifact-store", "fs", "Artifact store backend: fs or s3")
 	artifactDir := flag.String("artifact-dir", "artifact-data", "Filesystem artifact directory (single node or a shared mount)")
+	s3Bucket := flag.String("s3-bucket", "", "S3 bucket for artifacts")
+	s3Prefix := flag.String("s3-prefix", "", "S3 key prefix for artifacts")
+	s3Region := flag.String("s3-region", "", "S3 region override")
+	s3Endpoint := flag.String("s3-endpoint", "", "S3-compatible endpoint URL")
+	s3PathStyle := flag.Bool("s3-path-style", false, "Use path-style S3 URLs")
 	flag.Parse()
 
-	artifactStore, err := NewFileArtifactStore(*artifactDir)
+	var artifactStore ArtifactStore
+	var err error
+	switch *artifactBackend {
+	case "fs":
+		artifactStore, err = NewFileArtifactStore(*artifactDir)
+	case "s3":
+		artifactStore, err = NewS3ArtifactStore(context.Background(), S3ArtifactStoreOptions{
+			Bucket:    *s3Bucket,
+			Prefix:    *s3Prefix,
+			Region:    *s3Region,
+			Endpoint:  *s3Endpoint,
+			PathStyle: *s3PathStyle,
+		})
+	default:
+		log.Fatalf("unknown artifact store %q", *artifactBackend)
+	}
 	if err != nil {
-		log.Fatalf("failed to initialize artifact store: %v", err)
+		log.Fatalf("failed to initialize %s artifact store: %v", *artifactBackend, err)
 	}
 
 	// Make service objects

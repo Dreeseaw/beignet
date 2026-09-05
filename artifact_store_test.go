@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -71,4 +72,22 @@ func TestFileArtifactStoreDetectsCorruption(t *testing.T) {
 	if _, err := store.Get(context.Background(), hash); err == nil {
 		t.Fatal("Get accepted corrupt bytes")
 	}
+}
+
+func TestS3ArtifactStoreContract(t *testing.T) {
+	bucket := os.Getenv("BEIGNET_TEST_S3_BUCKET")
+	if bucket == "" {
+		t.Skip("BEIGNET_TEST_S3_BUCKET is not set")
+	}
+	store, err := NewS3ArtifactStore(context.Background(), S3ArtifactStoreOptions{
+		Bucket:    bucket,
+		Prefix:    os.Getenv("BEIGNET_TEST_S3_PREFIX"),
+		Region:    os.Getenv("AWS_REGION"),
+		Endpoint:  os.Getenv("BEIGNET_TEST_S3_ENDPOINT"),
+		PathStyle: strings.EqualFold(os.Getenv("BEIGNET_TEST_S3_PATH_STYLE"), "true"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testArtifactStoreContract(t, store)
 }
