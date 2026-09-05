@@ -21,6 +21,7 @@ import (
 //	        between machines is a non-issue)
 //	seq   — insertion order; a session is just a filter over steps by Seq
 type FSM struct {
+	mu    sync.RWMutex
 	blobs *sync.Map
 	steps *sync.Map
 	nodes *sync.Map // nodeID -> HTTP address; cluster metadata, for forwarding
@@ -189,6 +190,12 @@ func encodeOp(t OpType, data any) ([]byte, error) {
 // - each case is an operation, parse the JSON and do it
 // - we're inside a raft update here so be careful and NEVER BLOCK
 func (fsm *FSM) CoreApply(p *Payload) any {
+	fsm.mu.Lock()
+	defer fsm.mu.Unlock()
+	return fsm.coreApply(p)
+}
+
+func (fsm *FSM) coreApply(p *Payload) any {
 	switch p.Type {
 	case OpPutBlob:
 		var op PutBlobOp
@@ -292,18 +299,102 @@ func (fsm *FSM) Apply(entry *raft.Log) any {
 	return fsm.CoreApply(&p)
 }
 
-// Naive snapshotting implementation to begin
+const snapshotVersion = 1
+
+type persistedState struct {
+	Version int               `json:"version"`
+	Blobs   map[string][]byte `json:"blobs"`
+	Steps   map[string]Step   `json:"steps"`
+	Nodes   map[string]string `json:"nodes"`
+	Tick    uint64            `json:"tick"`
+	Seq     uint64            `json:"seq"`
+}
+
 type snapshot struct {
-	blobs *sync.Map
-	steps *sync.Map
+	state persistedState
 }
 
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
-	return &snapshot{blobs: f.blobs, steps: f.steps}, nil
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	state := persistedState{
+		Version: snapshotVersion,
+		Blobs:   make(map[string][]byte),
+		Steps:   make(map[string]Step),
+		Nodes:   make(map[string]string),
+		Tick:    f.tick,
+		Seq:     f.seq,
+	}
+	f.blobs.Range(func(k, v any) bool {
+		state.Blobs[k.(string)] = append([]byte(nil), v.([]byte)...)
+		return true
+	})
+	f.steps.Range(func(k, v any) bool {
+		step := v.(Step)
+		step.Spec = append(json.RawMessage(nil), step.Spec...)
+		step.Result = append(json.RawMessage(nil), step.Result...)
+		state.Steps[k.(string)] = step
+		return true
+	})
+	if f.nodes != nil {
+		f.nodes.Range(func(k, v any) bool {
+			state.Nodes[k.(string)] = v.(string)
+			return true
+		})
+	}
+	return &snapshot{state: state}, nil
 }
-func (f *FSM) Restore(rc io.ReadCloser) error { return nil }
+
+func clearSyncMap(m *sync.Map) {
+	m.Range(func(k, _ any) bool {
+		m.Delete(k)
+		return true
+	})
+}
+
+func (f *FSM) Restore(rc io.ReadCloser) error {
+	var state persistedState
+	if err := json.NewDecoder(rc).Decode(&state); err != nil {
+		return fmt.Errorf("decode FSM snapshot: %w", err)
+	}
+	if state.Version != snapshotVersion {
+		return fmt.Errorf("unsupported FSM snapshot version %d", state.Version)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	clearSyncMap(f.blobs)
+	clearSyncMap(f.steps)
+	if f.nodes == nil {
+		f.nodes = &sync.Map{}
+	} else {
+		clearSyncMap(f.nodes)
+	}
+	for k, v := range state.Blobs {
+		f.blobs.Store(k, append([]byte(nil), v...))
+	}
+	for k, step := range state.Steps {
+		step.Spec = append(json.RawMessage(nil), step.Spec...)
+		step.Result = append(json.RawMessage(nil), step.Result...)
+		f.steps.Store(k, step)
+	}
+	for k, v := range state.Nodes {
+		f.nodes.Store(k, v)
+	}
+	f.tick = state.Tick
+	f.seq = state.Seq
+	return nil
+}
+
 func (s *snapshot) Persist(sink raft.SnapshotSink) error {
-	sink.Write([]byte(`{}`))
-	return sink.Close()
+	if err := json.NewEncoder(sink).Encode(s.state); err != nil {
+		_ = sink.Cancel()
+		return fmt.Errorf("encode FSM snapshot: %w", err)
+	}
+	if err := sink.Close(); err != nil {
+		return fmt.Errorf("close FSM snapshot: %w", err)
+	}
+	return nil
 }
 func (s *snapshot) Release() {}
