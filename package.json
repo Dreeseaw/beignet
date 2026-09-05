@@ -1,6 +1,7 @@
 {
   "name": "beignet-ts",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "description": "Beignet TypeScript head, pull worker, Pi executor, and protocol conformance",
   "engines": {
