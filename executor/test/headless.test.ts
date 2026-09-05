@@ -57,7 +57,7 @@ before(async () => {
 		BEIGNET_SIDECAR_URL: sidecarUrl,
 		BEIGNET_FAKE_LLM: scriptPath,
 		BEIGNET_WORKER_ID: "headless-worker",
-		BEIGNET_WORKER_LABELS: JSON.stringify({ pool: "test" }),
+		BEIGNET_WORKER_LABELS: JSON.stringify({ pool: "test", zone: "east" }),
 		BEIGNET_RENEW_INTERVAL_MS: "100",
 	});
 	await waitHealthy(sidecarUrl);
@@ -89,7 +89,10 @@ async function steps(): Promise<any[]> {
 }
 
 test("a turn completes after the client exits", { timeout: 90_000 }, async () => {
-	const head = await runHead(["start", "--session", session, "--cwd", workDir, "do the thing"]);
+	const head = await runHead([
+		"start", "--session", session, "--cwd", workDir,
+		"--require", "pool=test", "--require", "zone=east", "do the thing",
+	]);
 	assert.equal(head.code, 0, `head failed: ${head.stderr}`);
 	assert.match(head.stdout, /detaching/);
 
@@ -117,6 +120,10 @@ test("a turn completes after the client exits", { timeout: 90_000 }, async () =>
 		"the cluster chained the whole turn unattended",
 	);
 	assert.ok(final.every((s) => s.state === "done"), "every step committed");
+	assert.ok(
+		final.every((s) => s.requirements?.pool === "test" && s.requirements?.zone === "east"),
+		"routing requirements follow the turn",
+	);
 
 	// Tool steps really ran, in order, on the machine.
 	assert.ok(existsSync(`${workDir}/one.txt`) && existsSync(`${workDir}/two.txt`));

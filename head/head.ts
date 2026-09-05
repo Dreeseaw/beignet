@@ -1,6 +1,7 @@
 // beignet head: a disposable client.
 //
-//   head.ts start [--session ID] [--model prov/id] [--cwd DIR] "message"
+//   head.ts start [--session ID] [--model prov/id] [--cwd DIR]
+//                 [--require KEY=VALUE] "message"
 //       Submits ONE llm step (?wait=false) and exits. The cluster runs the
 //       rest of the turn whether or not anything is watching.
 //
@@ -35,18 +36,20 @@ const VALUE_FLAGS = new Set(["session", "model", "cwd"]);
 function parseArgs(argv: string[]) {
 	const flags: Record<string, string> = {};
 	const positional: string[] = [];
+	const requirementFlags: string[] = [];
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg.startsWith("--")) {
 			const name = arg.slice(2);
-			if (VALUE_FLAGS.has(name)) flags[name] = argv[++i] ?? "";
+			if (name === "require") requirementFlags.push(argv[++i] ?? "");
+			else if (VALUE_FLAGS.has(name)) flags[name] = argv[++i] ?? "";
 			else flags[name] = "true";
 		} else positional.push(arg);
 	}
-	return { flags, positional };
+	return { flags, positional, requirementFlags };
 }
 
-const { flags, positional } = parseArgs(process.argv.slice(3));
+const { flags, positional, requirementFlags } = parseArgs(process.argv.slice(3));
 
 function flag(name: string, fallback?: string): string | undefined {
 	return flags[name] ?? fallback;
@@ -62,6 +65,14 @@ function toolDefs(cwd: string) {
 	].map((d: any) => ({ name: d.name, description: d.description, parameters: d.parameters }));
 }
 
+function requirements(): Record<string, string> {
+	return Object.fromEntries(requirementFlags.map((requirement) => {
+		const separator = requirement.indexOf("=");
+		if (separator < 1) throw new Error(`invalid --require ${JSON.stringify(requirement)}; expected KEY=VALUE`);
+		return [requirement.slice(0, separator), requirement.slice(separator + 1)];
+	}));
+}
+
 async function fetchSteps(session: string, since = 0): Promise<any[]> {
 	const res = await fetch(
 		`${SIDECAR}/v1/session/${encodeURIComponent(session)}/steps?since=${since}`,
@@ -73,7 +84,14 @@ async function fetchSteps(session: string, since = 0): Promise<any[]> {
 async function start() {
 	const message = positional.join(" ").trim();
 	if (!message) {
-		console.error('usage: head.ts start [--session ID] [--model prov/id] [--cwd DIR] "message"');
+		console.error('usage: head.ts start [--session ID] [--model prov/id] [--cwd DIR] [--require KEY=VALUE] "message"');
+		process.exit(2);
+	}
+	let required: Record<string, string>;
+	try {
+		required = requirements();
+	} catch (error: any) {
+		console.error(error?.message ?? error);
 		process.exit(2);
 	}
 	const session = flag("session") ?? `sess-${crypto.randomUUID().slice(0, 8)}`;
@@ -117,7 +135,7 @@ async function start() {
 	const res = await fetch(`${SIDECAR}/v1/step?wait=false`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ step_id: stepId, session, kind: "llm", spec }),
+		body: JSON.stringify({ step_id: stepId, session, kind: "llm", spec, requirements: required }),
 	});
 	if (res.status !== 202 && res.status !== 200) {
 		console.error(`submit failed: HTTP ${res.status} ${await res.text()}`);

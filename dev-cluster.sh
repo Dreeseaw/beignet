@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Boot a 3-node local cluster (sidecar + executor per node) and run one turn.
+# Boot a 3-node local cluster (sidecar + pull worker per node) and run one turn.
 #
 #   ./dev-cluster.sh              scripted LLM, no tokens
 #   ./dev-cluster.sh --live       real model (anthropic/claude-haiku-4-5)
 #
-# Ports: node N -> sidecar 47N0, executor 47N1, raft 700N
+# Ports: node N -> sidecar 47N0, raft 700N
 # Everything runs in a fresh temp dir; nothing touches ./raft-data.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -13,12 +13,11 @@ REPO="$PWD"
 LIVE=""
 [[ "${1:-}" == "--live" ]] && LIVE=1
 
-go build -o beignet . || { echo "build failed"; exit 1; }
-
 RUN="$(mktemp -d)"
 WORK="$RUN/work"
 mkdir -p "$WORK"
 echo "run dir: $RUN"
+go build -o "$RUN/beignet" . || { echo "build failed"; exit 1; }
 
 if [[ -z "$LIVE" ]]; then
   cat > "$RUN/script.json" <<SCRIPT
@@ -32,44 +31,46 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
-# --- executors (one per node, each talking to its OWN sidecar) ---
-for i in 1 2 3; do
-  env BEIGNET_EXECUTOR_PORT="47${i}1" \
-      BEIGNET_SIDECAR_URL="http://127.0.0.1:47${i}0" \
-      ${LIVE:+BEIGNET_MODEL=anthropic/claude-haiku-4-5} \
-      ${LIVE:-BEIGNET_FAKE_LLM=$RUN/script.json} \
-      node "$REPO/executor/executor.ts" > "$RUN/exec$i.log" 2>&1 &
-  PIDS+=($!)
-done
-sleep 2
-
 # --- sidecars (raft data isolated per node, under the run dir) ---
 for i in 1 2 3; do
   mkdir -p "$RUN/node$i"
-  ( cd "$RUN/node$i" && exec "$REPO/beignet" \
+  JOIN=()
+  [[ $i -ne 1 ]] && JOIN=(--join 127.0.0.1:4710)
+  ( cd "$RUN/node$i" && exec "$RUN/beignet" \
       --id "node$i" \
       --http "127.0.0.1:47${i}0" \
       --raft "127.0.0.1:700${i}" \
-      --executor "http://127.0.0.1:47${i}1" \
       --artifact-dir "$RUN/artifacts" \
-      ${i:+$([[ $i -eq 1 ]] || echo "--join 127.0.0.1:4710")} \
+      "${JOIN[@]}" \
     ) > "$RUN/node$i.log" 2>&1 &
   PIDS+=($!)
   [[ $i -eq 1 ]] && sleep 3   # let node1 win its election before others join
 done
 sleep 4
 
+# --- workers (one per node, each polling its OWN sidecar) ---
+for i in 1 2 3; do
+  env BEIGNET_SIDECAR_URL="http://127.0.0.1:47${i}0" \
+      BEIGNET_WORKER_ID="node$i-worker" \
+      BEIGNET_WORKER_LABELS="{\"pool\":\"default\",\"node\":\"node$i\"}" \
+      ${LIVE:+BEIGNET_MODEL=anthropic/claude-haiku-4-5} \
+      ${LIVE:-BEIGNET_FAKE_LLM=$RUN/script.json} \
+      node "$REPO/executor/worker.ts" > "$RUN/worker$i.log" 2>&1 &
+  PIDS+=($!)
+done
+sleep 2
+
 echo "=== cluster up (leader: node1) ==="
 echo "--- submitting one turn, then the head exits ---"
 ( cd "$WORK" && BEIGNET_SIDECAR_URL=http://127.0.0.1:4710 \
-    node "$REPO/head/head.ts" start --session trace1 --cwd "$WORK" \
+    node "$REPO/head/head.ts" start --session trace1 --cwd "$WORK" --require pool=default \
     "Use bash to write trace-42 into proof.txt, then cat it. Reply TRACE_COMPLETE." )
 
 echo
 echo "--- who executed what (all nodes) ---"
 sleep 8
 for i in 1 2 3; do
-  sed -n "s/.*> claimed/node$i  claimed/p" "$RUN/node$i.log" || true
+  sed -n "s/.*] claimed/node$i  claimed/p" "$RUN/worker$i.log" || true
 done | sort -k4
 
 echo
@@ -81,6 +82,6 @@ echo
 echo "workdir: $WORK   (proof.txt should exist)"
 ls -l "$WORK" || true
 echo
-echo "logs: $RUN/node{1,2,3}.log  $RUN/exec{1,2,3}.log"
+echo "logs: $RUN/node{1,2,3}.log  $RUN/worker{1,2,3}.log"
 echo "cluster still running — press Ctrl+C to stop."
 wait
