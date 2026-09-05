@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: npm test
+
+  seaweedfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Download SeaweedFS 4.41
+        run: |
+          curl --fail --location --retry 3 --output seaweedfs.tar.gz \
+            https://github.com/seaweedfs/seaweedfs/releases/download/4.41/linux_amd64.tar.gz
+          echo '730f1ede19972c12954ee407b2d97679a2e4486d24fd987d371761ec395571b8  seaweedfs.tar.gz' | sha256sum --check
+          tar -xzf seaweedfs.tar.gz weed
+      - run: ./scripts/test-seaweedfs.sh ./weed

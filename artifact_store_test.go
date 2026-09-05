@@ -8,6 +8,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 func artifactHash(data []byte) string {
@@ -79,7 +82,8 @@ func TestS3ArtifactStoreContract(t *testing.T) {
 	if bucket == "" {
 		t.Skip("BEIGNET_TEST_S3_BUCKET is not set")
 	}
-	store, err := NewS3ArtifactStore(context.Background(), S3ArtifactStoreOptions{
+	ctx := context.Background()
+	store, err := NewS3ArtifactStore(ctx, S3ArtifactStoreOptions{
 		Bucket:    bucket,
 		Prefix:    os.Getenv("BEIGNET_TEST_S3_PREFIX"),
 		Region:    os.Getenv("AWS_REGION"),
@@ -88,6 +92,11 @@ func TestS3ArtifactStoreContract(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if strings.EqualFold(os.Getenv("BEIGNET_TEST_S3_CREATE_BUCKET"), "true") {
+		if _, err := store.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(bucket)}); err != nil {
+			t.Fatalf("create test bucket: %v", err)
+		}
 	}
 	testArtifactStoreContract(t, store)
 }
