@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"strings"
 	"testing"
 
@@ -102,6 +104,26 @@ func TestS3ArtifactStoreContract(t *testing.T) {
 		}
 	}
 	testArtifactStoreContract(t, store)
+
+	data := []byte("beignet artifact contract")
+	hash := artifactHash(data)
+	expectedKey := path.Join(strings.Trim(os.Getenv("BEIGNET_TEST_S3_PREFIX"), "/"), "blobs", "sha256", hash[:2], hash)
+	if _, err := store.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(expectedKey),
+	}); err != nil {
+		t.Fatalf("artifact missing at expected S3 key %q: %v", expectedKey, err)
+	}
+	if _, err := store.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(expectedKey),
+		Body:   bytes.NewReader([]byte("corrupt")),
+	}); err != nil {
+		t.Fatalf("corrupt test artifact: %v", err)
+	}
+	if _, err := store.Get(ctx, hash); err == nil {
+		t.Fatal("Get accepted corrupt S3 bytes")
+	}
 }
 
 func TestS3ArtifactStoreClassifiesOnlyMissingKeysAsNotFound(t *testing.T) {
