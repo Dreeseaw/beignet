@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -17,10 +18,11 @@ type memorySnapshotSink struct {
 	bytes.Buffer
 	closed   bool
 	canceled bool
+	closeErr error
 }
 
 func (s *memorySnapshotSink) ID() string    { return "memory" }
-func (s *memorySnapshotSink) Close() error  { s.closed = true; return nil }
+func (s *memorySnapshotSink) Close() error  { s.closed = true; return s.closeErr }
 func (s *memorySnapshotSink) Cancel() error { s.canceled = true; return nil }
 
 func apply(t *testing.T, fsm *FSM, typ OpType, data any) any {
@@ -188,6 +190,38 @@ func TestCommitStoresResultAndChainsNextAtomically(t *testing.T) {
 	}
 }
 
+func TestCommitRejectsExistingSuccessorWithoutMutation(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "s1", "sess")
+	submit(t, fsm, "reserved", "other")
+	claim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s1", WorkerID: "worker1"}).(ClaimVerdict)
+	seqBefore := fsm.seq
+
+	verdict := apply(t, fsm, OpCommitResult, CommitResultOp{
+		StepID:   "s1",
+		WorkerID: "worker1",
+		Attempt:  claim.Attempt,
+		Result:   json.RawMessage(`{"content":"must not land"}`),
+		Next: &NextStep{
+			StepID: "reserved", Session: "sess", Kind: "llm", Spec: json.RawMessage(`{"model":"m"}`),
+		},
+	}).(CommitVerdict)
+
+	if verdict.Committed || verdict.Reason != "next step exists" {
+		t.Fatalf("collision verdict = %+v, want next step exists", verdict)
+	}
+	current := step(t, fsm, "s1")
+	if current.State != StateClaimed || len(current.Result) != 0 {
+		t.Errorf("rejected commit mutated current step: state=%s result=%s", current.State, current.Result)
+	}
+	if existing := step(t, fsm, "reserved"); existing.Session != "other" {
+		t.Errorf("rejected commit replaced existing successor: %+v", existing)
+	}
+	if fsm.seq != seqBefore {
+		t.Errorf("rejected commit consumed sequence: seq=%d, want %d", fsm.seq, seqBefore)
+	}
+}
+
 func TestCommitTwiceIsDuplicate(t *testing.T) {
 	fsm := newFSM()
 	submit(t, fsm, "s1", "sess")
@@ -285,5 +319,22 @@ func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 	}
 	if got := step(t, restored, "s2"); got.State != StatePending || got.Seq != 2 || got.Requirements["pool"] != "gpu" {
 		t.Fatalf("restored successor = %+v", got)
+	}
+}
+
+func TestSnapshotCloseFailureCancelsSink(t *testing.T) {
+	fsm := newFSM()
+	snapshot, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("close failed")
+	sink := &memorySnapshotSink{closeErr: closeErr}
+
+	if err := snapshot.Persist(sink); !errors.Is(err, closeErr) {
+		t.Fatalf("Persist error = %v, want close failure", err)
+	}
+	if !sink.closed || !sink.canceled {
+		t.Fatalf("failed snapshot sink lifecycle: closed=%v canceled=%v", sink.closed, sink.canceled)
 	}
 }

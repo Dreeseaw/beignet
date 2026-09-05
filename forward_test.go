@@ -65,3 +65,36 @@ func TestAllNodesRegisterHTTPAddresses(t *testing.T) {
 		})
 	}
 }
+
+func TestReadinessRejectsDeadLeader(t *testing.T) {
+	nodes := startCluster(t)
+	leader := findLeader(t, nodes)
+
+	var follower *node
+	for _, n := range nodes {
+		if n.id != leader.id {
+			follower = n
+			break
+		}
+	}
+	waitFor(t, follower.id+" is ready before failover", 10*time.Second, func() bool {
+		return ready(follower.httpAddr)
+	})
+
+	leader.kill()
+	resp, err := http.Get("http://" + follower.httpAddr + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("readiness after leader exit = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	waitFor(t, follower.id+" becomes ready after failover", 20*time.Second, func() bool {
+		return ready(follower.httpAddr)
+	})
+	if status, _ := putBlob(follower.httpAddr, `{"after":"failover"}`); status != http.StatusOK {
+		t.Fatalf("PUT after readiness recovered = %d, want %d", status, http.StatusOK)
+	}
+}
