@@ -59,7 +59,7 @@ test("an expired worker attempt cannot overwrite its replacement", { timeout: 30
 		try { return (await fetch(`${sidecar}/readyz`)).ok; } catch { return false; }
 	});
 
-	function startWorker(id: string) {
+	function startWorker(id: string, renewIntervalMs = "50") {
 		const child = spawn("node", [path.join(executorDir, "worker.ts")], {
 			cwd: runDir,
 			stdio: ["ignore", "pipe", "pipe"],
@@ -68,14 +68,16 @@ test("an expired worker attempt cannot overwrite its replacement", { timeout: 30
 				BEIGNET_SIDECAR_URL: sidecar,
 				BEIGNET_WORKER_ID: id,
 				BEIGNET_WORKER_LABELS: JSON.stringify({ pool: "fence" }),
-				BEIGNET_RENEW_INTERVAL_MS: "50",
+				BEIGNET_RENEW_INTERVAL_MS: renewIntervalMs,
 			},
 		});
 		children.push(child);
 		return { child, log: capture(child) };
 	}
 
-	const first = startWorker("worker-a");
+	// Keep A's renewal asleep for the whole fault window so its stale result
+	// must reach CommitResult and be fenced by the server after SIGCONT.
+	const first = startWorker("worker-a", "60000");
 	workerA = first.child;
 	const command = [
 		`printf 'start:%s\\n' \"$$\" >> ${history}`,
@@ -130,7 +132,8 @@ test("an expired worker attempt cannot overwrite its replacement", { timeout: 30
 	const accepted = JSON.stringify((await readStep()).result);
 	assert.match(accepted, new RegExp(`result:${secondPID}\\\\n`), `accepted result was not worker B's: ${accepted}`);
 	assert.doesNotMatch(accepted, new RegExp(`result:${firstPID}\\\\n`));
-	await waitFor("worker A's stale result to be rejected", () => /lease lost|commit fenced/.test(first.log()));
+	await waitFor("worker A's stale commit to be fenced", () => /commit fenced/.test(first.log()));
+	assert.doesNotMatch(first.log(), /lease lost/);
 	assert.match(second.log(), /claimed tool fenced-step attempt 1/);
 	assert.doesNotMatch(serverLog(), /panic|fatal error/i);
 });
