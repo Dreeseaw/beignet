@@ -2,3 +2,5 @@ docs/
 node_modules/
 beignet
 artifact-data/
+build/
+artifacts/benchmarks/
