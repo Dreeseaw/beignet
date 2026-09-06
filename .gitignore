@@ -2,5 +2,10 @@ docs/
 node_modules/
 beignet
 artifact-data/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
 build/
 artifacts/benchmarks/

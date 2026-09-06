@@ -1,0 +1,91 @@
+#!/bin/bash
+set -euo pipefail
+
+# With EC2 shutdown behavior set to terminate, schedule the cost ceiling before
+# any provisioning step that could fail or block operator access.
+systemd-run --unit=beignet-lab-expire --on-active=${ttl_minutes}m /usr/sbin/shutdown -h now
+
+install -d -m 0755 /opt/beignet /var/lib/beignet/node${node_number}
+aws s3 cp "s3://${bucket}/${control_object_key}" /opt/beignet/beignet
+aws s3 cp "s3://${bucket}/${bench_object_key}" /opt/beignet/beignet-bench
+chmod 0755 /opt/beignet/beignet /opt/beignet/beignet-bench
+ln -sf /opt/beignet/beignet /usr/local/bin/beignet
+ln -sf /opt/beignet/beignet-bench /usr/local/bin/beignet-bench
+
+cat >/etc/systemd/system/beignet-control.service <<'UNIT'
+[Unit]
+Description=Beignet control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/beignet/node${node_number}
+ExecStart=/usr/local/bin/beignet --id node${node_number} --http ${private_ip}:4700 --raft ${private_ip}:7000 %{if node_number != 1}--join ${leader_private_ip}:4700 %{endif}--artifact-store s3 --s3-bucket ${bucket} --s3-prefix artifacts/ --s3-region ${region}
+Restart=always
+RestartSec=2
+MemoryMax=2800M
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat >/etc/systemd/system/beignet-worker.service <<'UNIT'
+[Unit]
+Description=Beignet synthetic benchmark worker
+After=beignet-control.service
+Requires=beignet-control.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/beignet-bench worker --targets http://${private_ip}:4700 --run ${benchmark_run_id} --worker-prefix node${node_number} --concurrency ${worker_concurrency} --batch-size ${worker_batch_size} --duration ${ttl_minutes}m
+Restart=no
+CPUQuota=80%%
+MemoryMax=768M
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+
+# Terraform creates the instances concurrently, but the application join
+# handshake is deliberately one-shot. Do not start a joiner until node1 can
+# accept membership changes; if a transient join still misses, restarting the
+# empty joiner gives it another bounded attempt.
+%{ if node_number != 1 ~}
+leader_ready=0
+for attempt in $(seq 1 60); do
+  if curl -fsS "http://${leader_private_ip}:4700/readyz" >/dev/null; then
+    leader_ready=1
+    break
+  fi
+  sleep 2
+done
+if [[ "$leader_ready" -ne 1 ]]; then
+  echo "node1 never became ready" >&2
+  exit 1
+fi
+%{ endif ~}
+
+systemctl enable beignet-control.service
+systemctl start beignet-control.service
+control_ready=0
+for attempt in $(seq 1 20); do
+  sleep 3
+  if curl -fsS "http://${private_ip}:4700/readyz" >/dev/null; then
+    control_ready=1
+    break
+  fi
+%{ if node_number != 1 ~}
+  systemctl restart beignet-control.service
+%{ endif ~}
+done
+if [[ "$control_ready" -ne 1 ]]; then
+  echo "local control plane never became ready" >&2
+  exit 1
+fi
+
+systemctl enable --now beignet-worker.service
