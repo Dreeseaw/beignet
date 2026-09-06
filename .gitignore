@@ -1,6 +1,11 @@
-docs/
-node_modules/
-beignet
-artifact-data/
-build/
-artifacts/benchmarks/
+/node_modules/
+/beignet
+/artifact-data/
+/raft-data/
+/build/
+/artifacts/benchmarks/
+*.log
+.env
+.env.*.local
+/docs/.vitepress/cache/
+/docs/.vitepress/dist/
