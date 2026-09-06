@@ -226,6 +226,8 @@ const pollInterval = 25 * time.Millisecond
 
 // waitForDone blocks until the step commits or the caller goes away.
 func (h *HTTPServer) waitForDone(ctx context.Context, stepID string) (Step, error) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
 	for {
 		if v, ok := h.steps.Load(stepID); ok {
 			if step := v.(Step); step.State == StateDone {
@@ -235,7 +237,7 @@ func (h *HTTPServer) waitForDone(ctx context.Context, stepID string) (Step, erro
 		select {
 		case <-ctx.Done():
 			return Step{}, ctx.Err()
-		case <-time.After(pollInterval):
+		case <-ticker.C:
 		}
 	}
 }
