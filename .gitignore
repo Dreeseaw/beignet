@@ -4,6 +4,11 @@
 /raft-data/
 /build/
 /artifacts/benchmarks/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
 *.log
 .env
 .env.*.local
