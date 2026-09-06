@@ -363,11 +363,38 @@ func (h *HTTPServer) currentStatus() statusResponse {
 	return status
 }
 
-// Followers need the leader's HTTP address to route writes.
+func (h *HTTPServer) verifiedLeader() bool {
+	return h.raft.State() == raft.Leader && h.raft.VerifyLeader().Error() == nil
+}
+
+func (h *HTTPServer) internalReadyHandler(w http.ResponseWriter, r *http.Request) {
+	if !h.verifiedLeader() {
+		writeErr(w, http.StatusServiceUnavailable, "not a verified leader")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// Followers need a reachable, verified leader to route writes.
 func (h *HTTPServer) readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if h.raft.State() == raft.Leader {
+		h.internalReadyHandler(w, r)
+		return
+	}
 	status := h.currentStatus()
-	if status.LeaderID == "" || (h.raft.State() != raft.Leader && status.LeaderHTTPAddr == "") {
+	if status.LeaderID == "" || status.LeaderHTTPAddr == "" {
 		writeErr(w, http.StatusServiceUnavailable, "no routable leader")
+		return
+	}
+	client := &http.Client{Timeout: applyTimeout + 2*time.Second}
+	resp, err := client.Get("http://" + status.LeaderHTTPAddr + "/v1/internal/ready")
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "leader is unreachable")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		writeErr(w, http.StatusServiceUnavailable, "leader is not ready")
 		return
 	}
 	w.WriteHeader(http.StatusOK)

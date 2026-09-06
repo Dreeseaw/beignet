@@ -445,6 +445,7 @@ func (s *snapshot) Persist(sink raft.SnapshotSink) error {
 		return fmt.Errorf("encode FSM snapshot: %w", err)
 	}
 	if err := sink.Close(); err != nil {
+		_ = sink.Cancel()
 		return fmt.Errorf("close FSM snapshot: %w", err)
 	}
 	return nil

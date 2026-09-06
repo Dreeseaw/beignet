@@ -21,6 +21,11 @@ const SIDECAR = process.env.BEIGNET_SIDECAR_URL ?? "http://127.0.0.1:4700";
 const LLM_TIMEOUT_MS = 600_000;
 const TOOL_TIMEOUT_MS = 300_000;
 
+function timedSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+	const timeout = AbortSignal.timeout(timeoutMs);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
 const blobs = new BlobClient(SIDECAR);
 
 // pi's model runtime owns auth: stored API keys AND OAuth subscription
@@ -41,10 +46,11 @@ const toolFactories: Record<string, (cwd: string) => any> = {
 	ls: createLsTool,
 };
 
-async function runStep(kind: string, spec: any): Promise<any> {
+async function runStep(kind: string, spec: any, signal?: AbortSignal): Promise<any> {
+	signal?.throwIfAborted();
 	if (kind === "llm") {
 		const { model, context: refs, options } = spec;
-		const context = await rebuildContext(refs, (hash) => blobs.get(hash));
+		const context = await rebuildContext(refs, (hash) => blobs.get(hash, signal));
 		if (fakeLlm.length > 0) {
 			const priorReplies = context.messages.filter((message: any) => message?.role === "assistant").length;
 			return fakeLlm[priorReplies % fakeLlm.length];
@@ -54,7 +60,7 @@ async function runStep(kind: string, spec: any): Promise<any> {
 		const resolved = models.getModel(model.provider, model.id) ?? model;
 		return await models.completeSimple(resolved, context, {
 			...(options ?? {}),
-			signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+			signal: timedSignal(LLM_TIMEOUT_MS, signal),
 		});
 	}
 	if (kind === "tool") {
@@ -65,9 +71,10 @@ async function runStep(kind: string, spec: any): Promise<any> {
 			return await tool.execute(
 				`beignet-${crypto.randomUUID().slice(0, 8)}`,
 				spec.args,
-				AbortSignal.timeout(TOOL_TIMEOUT_MS),
+				timedSignal(TOOL_TIMEOUT_MS, signal),
 			);
 		} catch (e: any) {
+			if (signal?.aborted) signal.throwIfAborted();
 			// pi tools throw on failure (e.g. nonzero exit); that's a committed
 			// outcome, not an infra error — 5xx stays reserved for retryable.
 			return { toolError: e?.message ?? String(e) };
@@ -76,10 +83,12 @@ async function runStep(kind: string, spec: any): Promise<any> {
 	throw new Error(`unknown step kind: ${kind}`);
 }
 
-export async function executeStep(kind: string, spec: any, session = "") {
-	const result = await runStep(kind, spec);
+export async function executeStep(kind: string, spec: any, session = "", signal?: AbortSignal) {
+	const result = await runStep(kind, spec, signal);
+	signal?.throwIfAborted();
 	// Referenced blobs land before the control plane can commit the successor.
-	const next = await computeNext(session, kind, spec, result, blobs);
+	const next = await computeNext(session, kind, spec, result, blobs, signal);
+	signal?.throwIfAborted();
 	console.error(
 		`[executor] ${kind}${kind === "tool" ? `:${spec.tool}` : ""} ok` +
 			(next ? ` → next ${next.kind} ${next.step_id.slice(0, 12)}` : " → turn end"),

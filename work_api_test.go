@@ -76,6 +76,23 @@ func TestWorkerPullHonorsLabelsAndFencing(t *testing.T) {
 	correctRenew := workRenewRequest{WorkerID: "worker-1", StepID: claim.StepID, Attempt: claim.Attempt}
 	postJSON(t, follower.httpAddr, "/v1/work/renew", correctRenew, &renewal, http.StatusOK)
 
+	postJSON(t, leader.httpAddr, "/v1/step?wait=false", StepRequest{
+		StepID: "reserved", Session: "other", Kind: "tool", Spec: json.RawMessage(`{"tool":"bash"}`),
+		Requirements: map[string]string{"pool": "reserved"},
+	}, nil, http.StatusAccepted)
+	var collision CommitVerdict
+	postJSON(t, follower.httpAddr, "/v1/work/commit", workCommitRequest{
+		WorkerID: "worker-1", StepID: claim.StepID, Attempt: claim.Attempt,
+		Result: json.RawMessage(`{"must_not_land":true}`),
+		Next: &NextStep{
+			StepID: "reserved", Session: "work", Kind: "llm", Spec: json.RawMessage(`{"model":"m"}`),
+		},
+	}, &collision, http.StatusConflict)
+	if collision.Committed || collision.Reason != "next step exists" {
+		t.Fatalf("collision verdict = %+v, want next step exists", collision)
+	}
+	postJSON(t, follower.httpAddr, "/v1/work/renew", correctRenew, &renewal, http.StatusOK)
+
 	var commit CommitVerdict
 	postJSON(t, follower.httpAddr, "/v1/work/commit", workCommitRequest{
 		WorkerID: "worker-1", StepID: claim.StepID, Attempt: claim.Attempt,
