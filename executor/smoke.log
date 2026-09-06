@@ -1,6 +1,0 @@
-[fakecar] listening on 127.0.0.1:4700 (script: 0 canned llm steps)
-[executor] listening on 127.0.0.1:4701
-[fakecar] 84d2d32105a8 submit llm(refs=1)
-Error: Provider "anthropic" is configured with OAuth, not an API key
-[executor] llm ok
-[fakecar] 84d2d32105a816509bf2f3d3316da0a3979a2cea0d8df59f2f73b255c29b5c29 committed ok=true
