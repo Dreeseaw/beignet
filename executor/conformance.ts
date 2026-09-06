@@ -176,6 +176,7 @@ const missingHash = createHash("sha256").update(`${run}-missing`).digest("hex");
 const firstID = `${run}-z-first`;
 const nextID = `${run}-a-next`;
 const competingID = `${run}-competing`;
+const reservedNextID = `${run}-reserved-next`;
 const first = {
 	step_id: firstID,
 	session: run,
@@ -240,6 +241,33 @@ let claim: any;
 		wrongAttemptCommit.status === 409 && wrongAttemptCommit.json?.committed === false,
 		`HTTP ${wrongAttemptCommit.status}: ${wrongAttemptCommit.text}`);
 
+	const reserve = await post("/v1/step?wait=false", {
+		step_id: reservedNextID,
+		session: `${run}-reserved`,
+		kind: "tool",
+		spec: { tool: "bash", args: { command: "true" }, cwd: "/tmp" },
+		requirements: { pool: "reserved" },
+	});
+	check("successor collision fixture is accepted", reserve.status === 202,
+		`HTTP ${reserve.status}: ${reserve.text}`);
+	const collision = await post("/v1/work/commit", {
+		worker_id: "worker-a",
+		step_id: firstID,
+		attempt: claim.attempt,
+		result: { value: "must-not-land" },
+		next: { step_id: reservedNextID, session: run, kind: "llm", spec: { model: "opaque" } },
+	});
+	check("existing successor id rejects the whole commit",
+		collision.status === 409 && collision.json?.committed === false &&
+			collision.json?.reason === "next step exists",
+		`HTTP ${collision.status}: ${collision.text}`);
+	const afterCollision = await post("/v1/work/renew", {
+		worker_id: "worker-a", step_id: firstID, attempt: claim.attempt,
+	});
+	check("rejected successor collision leaves the claim live",
+		afterCollision.status === 200 && afterCollision.json?.renewed === true,
+		`HTTP ${afterCollision.status}: ${afterCollision.text}`);
+
 	const commit = await post("/v1/work/commit", {
 		worker_id: "worker-a",
 		step_id: firstID,
@@ -292,7 +320,7 @@ let claim: any;
 	const reservedID = `${run}-collision-reserved`;
 	const submitted = await post("/v1/steps", { steps: [
 		{ step_id: sourceID, session: `${run}-collision`, kind: "tool", spec: {}, requirements: { pool: "source" } },
-		{ step_id: reservedID, session: `${run}-collision`, kind: "tool", spec: {}, requirements: { pool: "reserved" } },
+		{ step_id: reservedID, session: `${run}-collision`, kind: "tool", spec: {}, requirements: { pool: "collision-reserved" } },
 	] });
 	check("collision fixtures are accepted", submitted.status === 202, `HTTP ${submitted.status}: ${submitted.text}`);
 	const source = await post("/v1/work/claim", { worker_id: "collision-source", labels: { pool: "source" } });
@@ -313,7 +341,7 @@ let claim: any;
 	const sourceDone = await post("/v1/work/commit", {
 		worker_id: "collision-source", step_id: sourceID, attempt: source.json?.attempt, result: { accepted: true },
 	});
-	const reserved = await post("/v1/work/claim", { worker_id: "collision-reserved", labels: { pool: "reserved" } });
+	const reserved = await post("/v1/work/claim", { worker_id: "collision-reserved", labels: { pool: "collision-reserved" } });
 	const reservedDone = await post("/v1/work/commit", {
 		worker_id: "collision-reserved", step_id: reservedID, attempt: reserved.json?.attempt, result: { accepted: true },
 	});
