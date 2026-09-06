@@ -2,6 +2,8 @@
 /beignet
 /artifact-data/
 /raft-data/
+/build/
+/artifacts/benchmarks/
 *.log
 .env
 .env.*.local
