@@ -48,8 +48,6 @@ fault tests, a real three-voter detached-turn demonstration, leader failover,
 snapshot/restart, the pull-protocol conformance probe, the filesystem artifact
 contract, the SeaweedFS-backed S3 contract, and the documentation build.
 
-### License gate
+### License
 
-No source license has been selected yet. The repository remains under default
-copyright, and the v0.1 tag must not be published until the maintainer chooses
-and adds a license.
+Beignet is licensed under the Apache License 2.0.
