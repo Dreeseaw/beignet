@@ -21,7 +21,7 @@ type Step = {
 
 const steps = new Map<string, Step>();
 const order = new Map<string, string[]>(); // session -> step ids, submission order
-const blobs = new Map<string, string>();
+const blobs = new Map<string, Buffer>();
 let renewals = 0;
 
 function submit(
@@ -41,7 +41,7 @@ function submit(
 	if (!order.has(session)) order.set(session, []);
 	order.get(session)!.push(id);
 	console.error(
-		`[fakecar] ${id.slice(0, 12)} submit ${kind}${kind === "tool" ? `:${spec.tool}` : ""} (session ${session.slice(0, 8)})`,
+		`[fakecar] ${id.slice(0, 12)} submit ${kind}${kind === "tool" ? `:${spec?.tool}` : ""} (session ${session.slice(0, 8)})`,
 	);
 	return step;
 }
@@ -86,6 +86,15 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 		let data = "";
 		req.on("data", (c) => (data += c));
 		req.on("end", () => resolve(data));
+		req.on("error", reject);
+	});
+}
+
+function readBytes(req: http.IncomingMessage): Promise<Buffer> {
+	return new Promise((resolve, reject) => {
+		const chunks: Buffer[] = [];
+		req.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+		req.on("end", () => resolve(Buffer.concat(chunks)));
 		req.on("error", reject);
 	});
 }
@@ -183,7 +192,7 @@ const server = http.createServer(async (req, res) => {
 	if (blobMatch) {
 		const hash = blobMatch[1];
 		if (req.method === "PUT") {
-			const body = await readBody(req);
+			const body = await readBytes(req);
 			if (createHash("sha256").update(body).digest("hex") !== hash) {
 				res.writeHead(400, { "content-type": "application/json" });
 				res.end(JSON.stringify({ error: "hash mismatch" }));

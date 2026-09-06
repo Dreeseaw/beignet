@@ -151,6 +151,7 @@ func main() {
 
 	// Node-to-node: followers forward writes here
 	http.HandleFunc("POST /v1/internal/apply", srv.internalApplyHandler)
+	http.HandleFunc("GET /v1/internal/ready", srv.internalReadyHandler)
 
 	go srv.tickLoop()
 	go srv.registerSelf()

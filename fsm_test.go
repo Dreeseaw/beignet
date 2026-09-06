@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -17,10 +18,11 @@ type memorySnapshotSink struct {
 	bytes.Buffer
 	closed   bool
 	canceled bool
+	closeErr error
 }
 
 func (s *memorySnapshotSink) ID() string    { return "memory" }
-func (s *memorySnapshotSink) Close() error  { s.closed = true; return nil }
+func (s *memorySnapshotSink) Close() error  { s.closed = true; return s.closeErr }
 func (s *memorySnapshotSink) Cancel() error { s.canceled = true; return nil }
 
 func apply(t *testing.T, fsm *FSM, typ OpType, data any) any {
@@ -317,5 +319,22 @@ func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 	}
 	if got := step(t, restored, "s2"); got.State != StatePending || got.Seq != 2 || got.Requirements["pool"] != "gpu" {
 		t.Fatalf("restored successor = %+v", got)
+	}
+}
+
+func TestSnapshotCloseFailureCancelsSink(t *testing.T) {
+	fsm := newFSM()
+	snapshot, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("close failed")
+	sink := &memorySnapshotSink{closeErr: closeErr}
+
+	if err := snapshot.Persist(sink); !errors.Is(err, closeErr) {
+		t.Fatalf("Persist error = %v, want close failure", err)
+	}
+	if !sink.closed || !sink.canceled {
+		t.Fatalf("failed snapshot sink lifecycle: closed=%v canceled=%v", sink.closed, sink.canceled)
 	}
 }
