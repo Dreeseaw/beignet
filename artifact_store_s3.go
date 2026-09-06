@@ -94,8 +94,11 @@ func (s *S3ArtifactStore) Get(ctx context.Context, hash string) ([]byte, error) 
 	})
 	if err != nil {
 		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) && strings.EqualFold(apiErr.ErrorCode(), "NoSuchKey") {
-			return nil, ErrArtifactNotFound
+		if errors.As(err, &apiErr) {
+			code := apiErr.ErrorCode()
+			if strings.EqualFold(code, "NoSuchKey") || strings.EqualFold(code, "NotFound") {
+				return nil, ErrArtifactNotFound
+			}
 		}
 		return nil, fmt.Errorf("get S3 artifact: %w", err)
 	}
