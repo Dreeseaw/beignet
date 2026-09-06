@@ -267,6 +267,36 @@ func TestCommitTwiceIsDuplicate(t *testing.T) {
 	}
 }
 
+func TestBatchedCommitReportsIndependentVerdicts(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "accepted", "sess")
+	submit(t, fsm, "fenced", "sess")
+	acceptedClaim := apply(t, fsm, OpClaimStep, ClaimStepOp{
+		StepID: "accepted", WorkerID: "worker1",
+	}).(ClaimVerdict)
+	fencedClaim := apply(t, fsm, OpClaimStep, ClaimStepOp{
+		StepID: "fenced", WorkerID: "worker2",
+	}).(ClaimVerdict)
+
+	verdicts := apply(t, fsm, OpCommitResults, CommitResultsOp{Commits: []CommitResultOp{
+		{StepID: "accepted", WorkerID: "worker1", Attempt: acceptedClaim.Attempt, Result: json.RawMessage(`1`)},
+		{StepID: "fenced", WorkerID: "worker2", Attempt: fencedClaim.Attempt + 1, Result: json.RawMessage(`2`)},
+	}}).([]CommitVerdict)
+
+	if len(verdicts) != 2 || !verdicts[0].Committed || verdicts[1].Committed || verdicts[1].Reason != "fenced" {
+		t.Fatalf("batch verdicts = %+v", verdicts)
+	}
+	if got := step(t, fsm, "accepted"); got.State != StateDone || string(got.Result) != `1` {
+		t.Fatalf("accepted step = %+v", got)
+	}
+	if got := step(t, fsm, "fenced"); got.State != StateClaimed || len(got.Result) != 0 {
+		t.Fatalf("fenced step mutated = %+v", got)
+	}
+	if fsm.work.hasOwned("worker1", "accepted") || !fsm.work.hasOwned("worker2", "fenced") {
+		t.Fatal("work index does not match mixed batch outcome")
+	}
+}
+
 func TestDoneStepIsNotClaimable(t *testing.T) {
 	fsm := newFSM()
 	submit(t, fsm, "s1", "sess")
