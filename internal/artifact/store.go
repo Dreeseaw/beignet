@@ -1,4 +1,4 @@
-package main
+package artifact
 
 import (
 	"context"
@@ -8,16 +8,18 @@ import (
 	"fmt"
 )
 
-var ErrArtifactNotFound = errors.New("artifact not found")
+// ErrNotFound means the immutable bytes do not exist in the backing store.
+var ErrNotFound = errors.New("artifact not found")
 
-// ArtifactStore owns immutable bytes. Raft owns only the small metadata that
-// says which hashes are safe for steps to reference.
-type ArtifactStore interface {
+// Store owns immutable bytes. Raft owns only the small metadata that says
+// which hashes are safe for steps to reference.
+type Store interface {
 	Put(ctx context.Context, hash string, data []byte) error
 	Get(ctx context.Context, hash string) ([]byte, error)
 }
 
-func validArtifactHash(hash string) bool {
+// ValidHash reports whether hash is a canonical lowercase SHA-256 digest.
+func ValidHash(hash string) bool {
 	if len(hash) != sha256.Size*2 {
 		return false
 	}
@@ -25,8 +27,9 @@ func validArtifactHash(hash string) bool {
 	return err == nil && len(decoded) == sha256.Size && hex.EncodeToString(decoded) == hash
 }
 
-func verifyArtifact(hash string, data []byte) error {
-	if !validArtifactHash(hash) {
+// Verify checks both the digest syntax and the bytes it identifies.
+func Verify(hash string, data []byte) error {
+	if !ValidHash(hash) {
 		return fmt.Errorf("invalid artifact hash %q", hash)
 	}
 	sum := sha256.Sum256(data)

@@ -70,4 +70,4 @@ BEIGNET_TEST_S3_PREFIX=ci/nested-prefix \
 BEIGNET_TEST_S3_ENDPOINT="http://127.0.0.1:$seaweed_s3_port" \
 BEIGNET_TEST_S3_PATH_STYLE=true \
 BEIGNET_TEST_S3_CREATE_BUCKET=true \
-go test -run '^TestS3ArtifactStoreContract$' -count=1 .
+go test -run '^TestS3StoreContract$' -count=1 ./internal/artifact

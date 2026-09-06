@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"beignet/internal/artifact"
+
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb"
 )
@@ -23,7 +25,7 @@ type HTTPServer struct {
 	steps         *sync.Map
 	nodes         *sync.Map
 	work          *workIndex
-	artifactStore ArtifactStore
+	artifactStore artifact.Store
 	nodeID        string
 	httpAddr      string
 }
@@ -44,13 +46,13 @@ func main() {
 	s3PathStyle := flag.Bool("s3-path-style", false, "Use path-style S3 URLs")
 	flag.Parse()
 
-	var artifactStore ArtifactStore
+	var artifactStore artifact.Store
 	var err error
 	switch *artifactBackend {
 	case "fs":
-		artifactStore, err = NewFileArtifactStore(*artifactDir)
+		artifactStore, err = artifact.NewFile(*artifactDir)
 	case "s3":
-		artifactStore, err = NewS3ArtifactStore(context.Background(), S3ArtifactStoreOptions{
+		artifactStore, err = artifact.NewS3(context.Background(), artifact.S3Options{
 			Bucket:    *s3Bucket,
 			Prefix:    *s3Prefix,
 			Region:    *s3Region,
