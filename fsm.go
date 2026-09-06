@@ -26,6 +26,7 @@ type FSM struct {
 	blobs *sync.Map
 	steps *sync.Map
 	nodes *sync.Map // nodeID -> HTTP address; cluster metadata, for forwarding
+	work  *workIndex
 	tick  uint64
 	seq   uint64
 }
@@ -201,6 +202,7 @@ func (fsm *FSM) insertStep(id, session, kind string, spec json.RawMessage, requi
 		ID: id, Session: session, Kind: kind, Spec: spec, Requirements: maps.Clone(requirements),
 		State: StatePending, Seq: fsm.seq,
 	})
+	fsm.work.addPending(id)
 	return true
 }
 
@@ -260,6 +262,8 @@ func (fsm *FSM) coreApply(p *Payload) any {
 			return ClaimVerdict{Reason: "owned by " + step.Owner}
 		}
 		fsm.steps.Store(op.StepID, step)
+		fsm.work.removePending(op.StepID)
+		fsm.work.addOwned(op.WorkerID, op.StepID)
 		return ClaimVerdict{Won: true, Attempt: step.Attempt}
 
 	case OpRenewStep:
@@ -303,6 +307,7 @@ func (fsm *FSM) coreApply(p *Payload) any {
 			}
 		}
 		fsm.steps.Store(op.StepID, step)
+		fsm.work.removeOwned(op.WorkerID, op.StepID)
 
 		// ATOMIC with the commit: the successor enters the ledger in this same
 		// Apply, so no crash can strand a turn between "done" and "chained".
@@ -325,8 +330,11 @@ func (fsm *FSM) coreApply(p *Payload) any {
 		fsm.tick++
 		fsm.steps.Range(func(_, v any) bool {
 			if step := v.(Step); step.expired(fsm.tick) {
+				owner := step.Owner
 				step.release()
 				fsm.steps.Store(step.ID, step)
+				fsm.work.removeOwned(owner, step.ID)
+				fsm.work.addPending(step.ID)
 			}
 			return true
 		})
@@ -417,6 +425,11 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	defer f.mu.Unlock()
 	clearSyncMap(f.blobs)
 	clearSyncMap(f.steps)
+	if f.work == nil {
+		f.work = newWorkIndex()
+	} else {
+		f.work.reset()
+	}
 	if f.nodes == nil {
 		f.nodes = &sync.Map{}
 	} else {
@@ -430,6 +443,12 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 		step.Result = append(json.RawMessage(nil), step.Result...)
 		step.Requirements = maps.Clone(step.Requirements)
 		f.steps.Store(k, step)
+		switch step.State {
+		case StatePending:
+			f.work.addPending(k)
+		case StateClaimed:
+			f.work.addOwned(step.Owner, k)
+		}
 	}
 	for k, v := range state.Nodes {
 		f.nodes.Store(k, v)

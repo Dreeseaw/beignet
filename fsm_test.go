@@ -11,7 +11,7 @@ import (
 
 // The FSM is just structs and maps — no raft needed to test any invariant.
 func newFSM() *FSM {
-	return &FSM{blobs: &sync.Map{}, steps: &sync.Map{}, nodes: &sync.Map{}}
+	return &FSM{blobs: &sync.Map{}, steps: &sync.Map{}, nodes: &sync.Map{}, work: newWorkIndex()}
 }
 
 type memorySnapshotSink struct {
@@ -92,6 +92,34 @@ func TestClaimIsFirstWriterWins(t *testing.T) {
 	}
 }
 
+func TestWorkIndexTracksClaimCommitAndExpiry(t *testing.T) {
+	fsm := newFSM()
+	submit(t, fsm, "commit", "sess")
+	submit(t, fsm, "expire", "sess")
+
+	commitClaim := apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "commit", WorkerID: "worker1"}).(ClaimVerdict)
+	apply(t, fsm, OpCommitResult, CommitResultOp{
+		StepID: "commit", WorkerID: "worker1", Attempt: commitClaim.Attempt, Result: json.RawMessage(`1`),
+	})
+	if fsm.work.hasPending("commit") {
+		t.Fatal("committed step remained pending")
+	}
+	if fsm.work.hasOwned("worker1", "commit") {
+		t.Fatal("committed step remained owned")
+	}
+
+	apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "expire", WorkerID: "worker2"})
+	for i := 0; i <= leaseTicks; i++ {
+		apply(t, fsm, OpTick, struct{}{})
+	}
+	if !fsm.work.hasPending("expire") {
+		t.Fatal("expired step was not returned to the pending index")
+	}
+	if fsm.work.hasOwned("worker2", "expire") {
+		t.Fatal("expired step remained owned")
+	}
+}
+
 func TestRenewRequiresTheCurrentWorkerAndAttempt(t *testing.T) {
 	fsm := newFSM()
 	submit(t, fsm, "s1", "sess")
@@ -115,6 +143,9 @@ func TestRenewRequiresTheCurrentWorkerAndAttempt(t *testing.T) {
 	}
 	if got := step(t, fsm, "s1").ClaimTick; got != fsm.tick {
 		t.Errorf("ClaimTick = %d, want %d (renewal must refresh it)", got, fsm.tick)
+	}
+	if !fsm.work.hasOwned("worker1", "s1") {
+		t.Fatal("renewed claim is missing from the owned-work index")
 	}
 }
 
@@ -283,6 +314,8 @@ func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 			StepID: "s2", Session: "sess", Kind: "llm", Spec: json.RawMessage(`{"model":"m"}`),
 		},
 	})
+	submit(t, fsm, "s3", "other")
+	apply(t, fsm, OpClaimStep, ClaimStepOp{StepID: "s3", WorkerID: "worker3"})
 
 	snapshotBeforeMutation, err := fsm.Snapshot()
 	if err != nil {
@@ -302,8 +335,8 @@ func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 	if err := restored.Restore(io.NopCloser(bytes.NewReader(sink.Bytes()))); err != nil {
 		t.Fatal(err)
 	}
-	if restored.tick != 7 || restored.seq != 2 {
-		t.Fatalf("restored counters: tick=%d seq=%d, want 7 and 2", restored.tick, restored.seq)
+	if restored.tick != 7 || restored.seq != 3 {
+		t.Fatalf("restored counters: tick=%d seq=%d, want 7 and 3", restored.tick, restored.seq)
 	}
 	if v, ok := restored.blobs.Load(hash); !ok || v.(ArtifactMeta).Size != 5 {
 		t.Fatalf("restored blob = %q, present=%v", v, ok)
@@ -319,6 +352,13 @@ func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 	}
 	if got := step(t, restored, "s2"); got.State != StatePending || got.Seq != 2 || got.Requirements["pool"] != "gpu" {
 		t.Fatalf("restored successor = %+v", got)
+	}
+	if !restored.work.hasPending("s2") {
+		t.Fatal("restored pending step is missing from the work index")
+	}
+	if got := step(t, restored, "s3"); got.State != StateClaimed || got.Owner != "worker3" ||
+		!restored.work.hasOwned("worker3", "s3") {
+		t.Fatalf("restored claim or work index = %+v", got)
 	}
 }
 
