@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +14,11 @@ import (
 // The FSM is just structs and maps — no raft needed to test any invariant.
 func newFSM() *FSM {
 	return &FSM{blobs: &sync.Map{}, steps: &sync.Map{}, nodes: &sync.Map{}, work: newWorkIndex()}
+}
+
+func fsmArtifactHash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 type memorySnapshotSink struct {
@@ -313,7 +320,7 @@ func TestDoneStepIsNotClaimable(t *testing.T) {
 
 func TestPutBlobIsIdempotent(t *testing.T) {
 	fsm := newFSM()
-	hash := artifactHash([]byte("hello"))
+	hash := fsmArtifactHash([]byte("hello"))
 	apply(t, fsm, OpPutBlob, PutBlobOp{Hash: hash, Size: 5})
 	apply(t, fsm, OpPutBlob, PutBlobOp{Hash: hash, Size: 99})
 
@@ -325,8 +332,8 @@ func TestPutBlobIsIdempotent(t *testing.T) {
 
 func TestSnapshotRoundTripPreservesCompleteState(t *testing.T) {
 	fsm := newFSM()
-	hash := artifactHash([]byte("hello"))
-	laterHash := artifactHash([]byte("after snapshot"))
+	hash := fsmArtifactHash([]byte("hello"))
+	laterHash := fsmArtifactHash([]byte("after snapshot"))
 	apply(t, fsm, OpPutBlob, PutBlobOp{Hash: hash, Size: 5})
 	apply(t, fsm, OpSetNode, SetNodeOp{NodeID: "node1", HTTPAddr: "127.0.0.1:4700"})
 	apply(t, fsm, OpSubmitStep, SubmitStepOp{

@@ -10,6 +10,8 @@ import (
 	"maps"
 	"sync"
 
+	"beignet/internal/artifact"
+
 	"github.com/hashicorp/raft"
 )
 
@@ -313,7 +315,7 @@ func (fsm *FSM) coreApply(p *Payload) any {
 		if err := json.Unmarshal(p.Data, &op); err != nil {
 			return fmt.Errorf("invalid PutBlob data: %w", err)
 		}
-		if !validArtifactHash(op.Hash) || op.Size < 0 {
+		if !artifact.ValidHash(op.Hash) || op.Size < 0 {
 			return fmt.Errorf("invalid artifact metadata")
 		}
 		if _, exists := fsm.blobs.Load(op.Hash); !exists {

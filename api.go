@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"time"
 
+	"beignet/internal/artifact"
+
 	"github.com/hashicorp/raft"
 )
 
@@ -256,7 +258,7 @@ func (h *HTTPServer) hashGetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b, err := h.artifactStore.Get(r.Context(), hashID)
-	if errors.Is(err, ErrArtifactNotFound) {
+	if errors.Is(err, artifact.ErrNotFound) {
 		writeErr(w, http.StatusInternalServerError, "artifact metadata exists but bytes are missing")
 		return
 	}
@@ -277,7 +279,7 @@ func (h *HTTPServer) hashSetHandler(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusRequestEntityTooLarge, "artifact exceeds 64 MiB or could not be read")
 		return
 	}
-	if err := verifyArtifact(hashID, bodyBytes); err != nil {
+	if err := artifact.Verify(hashID, bodyBytes); err != nil {
 		writeErr(w, http.StatusBadRequest, "hash mismatch")
 		return
 	}

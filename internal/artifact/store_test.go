@@ -1,4 +1,4 @@
-package main
+package artifact
 
 import (
 	"bytes"
@@ -23,14 +23,14 @@ func artifactHash(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func testArtifactStoreContract(t *testing.T, store ArtifactStore) {
+func testStoreContract(t *testing.T, store Store) {
 	t.Helper()
 	ctx := context.Background()
 	data := []byte("beignet artifact contract")
 	hash := artifactHash(data)
 
-	if _, err := store.Get(ctx, hash); !errors.Is(err, ErrArtifactNotFound) {
-		t.Fatalf("missing Get error = %v, want ErrArtifactNotFound", err)
+	if _, err := store.Get(ctx, hash); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing Get error = %v, want ErrNotFound", err)
 	}
 	if err := store.Put(ctx, hash, data); err != nil {
 		t.Fatal(err)
@@ -52,16 +52,16 @@ func testArtifactStoreContract(t *testing.T, store ArtifactStore) {
 	}
 }
 
-func TestFileArtifactStoreContract(t *testing.T) {
-	store, err := NewFileArtifactStore(t.TempDir())
+func TestFileStoreContract(t *testing.T) {
+	store, err := NewFile(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	testArtifactStoreContract(t, store)
+	testStoreContract(t, store)
 }
 
-func TestFileArtifactStoreDetectsCorruption(t *testing.T) {
-	store, err := NewFileArtifactStore(t.TempDir())
+func TestFileStoreDetectsCorruption(t *testing.T) {
+	store, err := NewFile(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,13 +82,13 @@ func TestFileArtifactStoreDetectsCorruption(t *testing.T) {
 	}
 }
 
-func TestS3ArtifactStoreContract(t *testing.T) {
+func TestS3StoreContract(t *testing.T) {
 	bucket := os.Getenv("BEIGNET_TEST_S3_BUCKET")
 	if bucket == "" {
 		t.Skip("BEIGNET_TEST_S3_BUCKET is not set")
 	}
 	ctx := context.Background()
-	store, err := NewS3ArtifactStore(ctx, S3ArtifactStoreOptions{
+	store, err := NewS3(ctx, S3Options{
 		Bucket:    bucket,
 		Prefix:    os.Getenv("BEIGNET_TEST_S3_PREFIX"),
 		Region:    os.Getenv("AWS_REGION"),
@@ -103,7 +103,7 @@ func TestS3ArtifactStoreContract(t *testing.T) {
 			t.Fatalf("create test bucket: %v", err)
 		}
 	}
-	testArtifactStoreContract(t, store)
+	testStoreContract(t, store)
 
 	data := []byte("beignet artifact contract")
 	hash := artifactHash(data)
@@ -126,7 +126,7 @@ func TestS3ArtifactStoreContract(t *testing.T) {
 	}
 }
 
-func TestS3ArtifactStoreClassifiesOnlyMissingKeysAsNotFound(t *testing.T) {
+func TestS3StoreClassifiesOnlyMissingKeysAsNotFound(t *testing.T) {
 	for _, test := range []struct {
 		code         string
 		wantNotFound bool
@@ -149,10 +149,10 @@ func TestS3ArtifactStoreClassifiesOnlyMissingKeysAsNotFound(t *testing.T) {
 				Credentials:  aws.AnonymousCredentials{},
 				UsePathStyle: true,
 			})
-			store := &S3ArtifactStore{client: client, bucket: "bucket"}
+			store := &S3Store{client: client, bucket: "bucket"}
 			_, err := store.Get(context.Background(), artifactHash([]byte("missing")))
-			if got := errors.Is(err, ErrArtifactNotFound); got != test.wantNotFound {
-				t.Fatalf("errors.Is(%v, ErrArtifactNotFound) = %v, want %v", err, got, test.wantNotFound)
+			if got := errors.Is(err, ErrNotFound); got != test.wantNotFound {
+				t.Fatalf("errors.Is(%v, ErrNotFound) = %v, want %v", err, got, test.wantNotFound)
 			}
 		})
 	}
