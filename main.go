@@ -22,6 +22,7 @@ type HTTPServer struct {
 	blobs         *sync.Map // hash -> ArtifactMeta; immutable bytes live in artifactStore
 	steps         *sync.Map
 	nodes         *sync.Map
+	work          *workIndex
 	artifactStore ArtifactStore
 	nodeID        string
 	httpAddr      string
@@ -67,7 +68,8 @@ func main() {
 	blobs := &sync.Map{}
 	steps := &sync.Map{}
 	nodes := &sync.Map{}
-	fsm := &FSM{blobs: blobs, steps: steps, nodes: nodes}
+	work := newWorkIndex()
+	fsm := &FSM{blobs: blobs, steps: steps, nodes: nodes, work: work}
 
 	// Raft Configurations
 	config := raft.DefaultConfig()
@@ -127,6 +129,7 @@ func main() {
 		blobs:         blobs,
 		steps:         steps,
 		nodes:         nodes,
+		work:          work,
 		artifactStore: artifactStore,
 		nodeID:        *nodeID,
 		httpAddr:      *httpAddr,
