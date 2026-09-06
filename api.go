@@ -72,19 +72,27 @@ func (h *HTTPServer) forward(t OpType, op []byte) (any, error) {
 	// Rebuild the typed verdict the caller expects.
 	switch t {
 	case OpClaimStep:
-		var v ClaimVerdict
-		json.Unmarshal(raw, &v)
-		return v, nil
+		return decodeForwarded[ClaimVerdict](raw)
+	case OpClaimSteps:
+		return decodeForwarded[[]ClaimVerdict](raw)
 	case OpRenewStep:
-		var v RenewVerdict
-		json.Unmarshal(raw, &v)
-		return v, nil
+		return decodeForwarded[RenewVerdict](raw)
+	case OpRenewSteps:
+		return decodeForwarded[[]RenewVerdict](raw)
 	case OpCommitResult:
-		var v CommitVerdict
-		json.Unmarshal(raw, &v)
-		return v, nil
+		return decodeForwarded[CommitVerdict](raw)
+	case OpCommitResults:
+		return decodeForwarded[[]CommitVerdict](raw)
 	}
 	return nil, nil
+}
+
+func decodeForwarded[T any](raw []byte) (any, error) {
+	var verdict T
+	if err := json.Unmarshal(raw, &verdict); err != nil {
+		return nil, fmt.Errorf("decode leader verdict: %w", err)
+	}
+	return verdict, nil
 }
 
 // POST /v1/internal/apply — node-to-node: run a forwarded op through raft.
@@ -124,6 +132,15 @@ type StepRequest struct {
 type StepResponse struct {
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  json.RawMessage `json:"error,omitempty"`
+}
+
+type stepBatchRequest struct {
+	Steps []StepRequest `json:"steps"`
+}
+
+func validStepRequest(step StepRequest) bool {
+	return step.StepID != "" && step.Session != "" && len(step.Spec) > 0 &&
+		(step.Kind == "llm" || step.Kind == "tool")
 }
 
 func (h *HTTPServer) stepHandler(w http.ResponseWriter, r *http.Request) {
@@ -175,6 +192,34 @@ func (h *HTTPServer) stepHandler(w http.ResponseWriter, r *http.Request) {
 	response.Result = step.Result
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
+}
+
+func (h *HTTPServer) stepBatchHandler(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	var request stepBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil ||
+		len(request.Steps) == 0 || len(request.Steps) > maxOperationBatch {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("steps must contain 1-%d valid items", maxOperationBatch))
+		return
+	}
+	operations := make([]SubmitStepOp, len(request.Steps))
+	for i, step := range request.Steps {
+		if !validStepRequest(step) {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("step %d is invalid", i))
+			return
+		}
+		operations[i] = SubmitStepOp{
+			StepID: step.StepID, Session: step.Session, Kind: step.Kind,
+			Spec: step.Spec, Requirements: step.Requirements,
+		}
+	}
+	if _, err := h.applyOp(OpSubmitSteps, SubmitStepsOp{Steps: operations}); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]int{"accepted": len(operations)})
 }
 
 const pollInterval = 25 * time.Millisecond
@@ -292,6 +337,36 @@ type sessionStep struct {
 	Spec         json.RawMessage   `json:"spec"`
 	Requirements map[string]string `json:"requirements,omitempty"`
 	Result       json.RawMessage   `json:"result,omitempty"`
+}
+
+type sessionSummaryResponse struct {
+	Observed int `json:"observed"`
+	Pending  int `json:"pending"`
+	Claimed  int `json:"claimed"`
+	Done     int `json:"done"`
+}
+
+func (h *HTTPServer) sessionSummaryHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	session := r.PathValue("session")
+	var summary sessionSummaryResponse
+	h.steps.Range(func(_, value any) bool {
+		step := value.(Step)
+		if step.Session != session {
+			return true
+		}
+		summary.Observed++
+		switch step.State {
+		case StatePending:
+			summary.Pending++
+		case StateClaimed:
+			summary.Claimed++
+		case StateDone:
+			summary.Done++
+		}
+		return true
+	})
+	json.NewEncoder(w).Encode(summary)
 }
 
 func (h *HTTPServer) sessionStepsHandler(w http.ResponseWriter, r *http.Request) {

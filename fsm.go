@@ -113,14 +113,20 @@ func (s *Step) release() {
 type OpType string
 
 const (
-	OpPutBlob      OpType = "PutBlob"
-	OpSubmitStep   OpType = "SubmitStep"
-	OpClaimStep    OpType = "ClaimStep"
-	OpRenewStep    OpType = "RenewStep"
-	OpCommitResult OpType = "CommitResult"
-	OpTick         OpType = "Tick"
-	OpSetNode      OpType = "SetNode"
+	OpPutBlob       OpType = "PutBlob"
+	OpSubmitStep    OpType = "SubmitStep"
+	OpSubmitSteps   OpType = "SubmitSteps"
+	OpClaimStep     OpType = "ClaimStep"
+	OpClaimSteps    OpType = "ClaimSteps"
+	OpRenewStep     OpType = "RenewStep"
+	OpRenewSteps    OpType = "RenewSteps"
+	OpCommitResult  OpType = "CommitResult"
+	OpCommitResults OpType = "CommitResults"
+	OpTick          OpType = "Tick"
+	OpSetNode       OpType = "SetNode"
 )
+
+const maxOperationBatch = 256
 
 // SetNodeOp publishes a node's HTTP address so followers can forward writes.
 type SetNodeOp struct {
@@ -141,15 +147,27 @@ type SubmitStepOp struct {
 	Requirements map[string]string `json:"requirements,omitempty"`
 }
 
+type SubmitStepsOp struct {
+	Steps []SubmitStepOp `json:"steps"`
+}
+
 type ClaimStepOp struct {
 	StepID   string `json:"step_id"`
 	WorkerID string `json:"worker_id"`
+}
+
+type ClaimStepsOp struct {
+	Claims []ClaimStepOp `json:"claims"`
 }
 
 type RenewStepOp struct {
 	StepID   string `json:"step_id"`
 	WorkerID string `json:"worker_id"`
 	Attempt  int    `json:"attempt"`
+}
+
+type RenewStepsOp struct {
+	Renewals []RenewStepOp `json:"renewals"`
 }
 
 // NextStep is the successor the executor computed. Opaque to us: we carry it.
@@ -166,6 +184,10 @@ type CommitResultOp struct {
 	Attempt  int             `json:"attempt"`
 	Result   json.RawMessage `json:"result"`
 	Next     *NextStep       `json:"next,omitempty"`
+}
+
+type CommitResultsOp struct {
+	Commits []CommitResultOp `json:"commits"`
 }
 
 type Payload struct {
@@ -224,6 +246,66 @@ func (fsm *FSM) CoreApply(p *Payload) any {
 	return fsm.coreApply(p)
 }
 
+func (fsm *FSM) claimStep(op ClaimStepOp) ClaimVerdict {
+	v, found := fsm.steps.Load(op.StepID)
+	if !found {
+		return ClaimVerdict{Reason: "unknown step"}
+	}
+	step := v.(Step)
+	if step.State == StateDone {
+		return ClaimVerdict{Reason: "already done"}
+	}
+	if !step.claim(op.WorkerID, fsm.tick) {
+		return ClaimVerdict{Reason: "owned by " + step.Owner}
+	}
+	fsm.steps.Store(op.StepID, step)
+	fsm.work.removePending(op.StepID)
+	fsm.work.addOwned(op.WorkerID, op.StepID)
+	return ClaimVerdict{Won: true, Attempt: step.Attempt}
+}
+
+func (fsm *FSM) renewStep(op RenewStepOp) RenewVerdict {
+	v, found := fsm.steps.Load(op.StepID)
+	if !found {
+		return RenewVerdict{Reason: "unknown step"}
+	}
+	step := v.(Step)
+	if !step.renew(op.WorkerID, op.Attempt, fsm.tick) {
+		return RenewVerdict{Reason: "fenced"}
+	}
+	fsm.steps.Store(op.StepID, step)
+	return RenewVerdict{Renewed: true}
+}
+
+func (fsm *FSM) commitResult(op CommitResultOp) CommitVerdict {
+	v, found := fsm.steps.Load(op.StepID)
+	if !found {
+		return CommitVerdict{Reason: "unknown step"}
+	}
+	step := v.(Step)
+	if step.State == StateDone {
+		return CommitVerdict{Reason: "duplicate"}
+	}
+	if !step.commit(op.WorkerID, op.Attempt, op.Result) {
+		return CommitVerdict{Reason: "fenced"}
+	}
+	// Check the successor before storing the mutated step copy. A collision
+	// rejects the result too, leaving the current claim live and renewable.
+	if op.Next != nil {
+		if _, exists := fsm.steps.Load(op.Next.StepID); exists {
+			return CommitVerdict{Reason: "next step exists"}
+		}
+	}
+	fsm.steps.Store(op.StepID, step)
+	fsm.work.removeOwned(op.WorkerID, op.StepID)
+	// Result and successor are applied under the same FSM lock and Raft entry,
+	// so a crash cannot expose Done without its fresh successor.
+	if op.Next != nil {
+		fsm.insertStep(op.Next.StepID, op.Next.Session, op.Next.Kind, op.Next.Spec, step.Requirements)
+	}
+	return CommitVerdict{Committed: true}
+}
+
 func (fsm *FSM) coreApply(p *Payload) any {
 	switch p.Type {
 	case OpPutBlob:
@@ -245,75 +327,80 @@ func (fsm *FSM) coreApply(p *Payload) any {
 		}
 		fsm.insertStep(op.StepID, op.Session, op.Kind, op.Spec, op.Requirements)
 
+	case OpSubmitSteps:
+		var op SubmitStepsOp
+		if err := json.Unmarshal(p.Data, &op); err != nil {
+			return fmt.Errorf("invalid SubmitSteps data: %w", err)
+		}
+		if len(op.Steps) == 0 || len(op.Steps) > maxOperationBatch {
+			return fmt.Errorf("SubmitSteps must contain 1-%d steps", maxOperationBatch)
+		}
+		for _, step := range op.Steps {
+			fsm.insertStep(step.StepID, step.Session, step.Kind, step.Spec, step.Requirements)
+		}
+
 	case OpClaimStep:
 		var op ClaimStepOp
 		if err := json.Unmarshal(p.Data, &op); err != nil {
 			return fmt.Errorf("invalid ClaimStep data: %w", err)
 		}
-		v, found := fsm.steps.Load(op.StepID)
-		if !found {
-			return ClaimVerdict{Reason: "unknown step"}
+		return fsm.claimStep(op)
+
+	case OpClaimSteps:
+		var op ClaimStepsOp
+		if err := json.Unmarshal(p.Data, &op); err != nil {
+			return fmt.Errorf("invalid ClaimSteps data: %w", err)
 		}
-		step := v.(Step)
-		if step.State == StateDone {
-			return ClaimVerdict{Reason: "already done"}
+		if len(op.Claims) == 0 || len(op.Claims) > maxOperationBatch {
+			return fmt.Errorf("ClaimSteps must contain 1-%d claims", maxOperationBatch)
 		}
-		if !step.claim(op.WorkerID, fsm.tick) { // CAS through consensus
-			return ClaimVerdict{Reason: "owned by " + step.Owner}
+		verdicts := make([]ClaimVerdict, len(op.Claims))
+		for i, claim := range op.Claims {
+			verdicts[i] = fsm.claimStep(claim)
 		}
-		fsm.steps.Store(op.StepID, step)
-		fsm.work.removePending(op.StepID)
-		fsm.work.addOwned(op.WorkerID, op.StepID)
-		return ClaimVerdict{Won: true, Attempt: step.Attempt}
+		return verdicts
 
 	case OpRenewStep:
 		var op RenewStepOp
 		if err := json.Unmarshal(p.Data, &op); err != nil {
 			return fmt.Errorf("invalid RenewStep data: %w", err)
 		}
-		v, found := fsm.steps.Load(op.StepID)
-		if !found {
-			return RenewVerdict{Reason: "unknown step"}
+		return fsm.renewStep(op)
+
+	case OpRenewSteps:
+		var op RenewStepsOp
+		if err := json.Unmarshal(p.Data, &op); err != nil {
+			return fmt.Errorf("invalid RenewSteps data: %w", err)
 		}
-		step := v.(Step)
-		if !step.renew(op.WorkerID, op.Attempt, fsm.tick) {
-			return RenewVerdict{Reason: "fenced"}
+		if len(op.Renewals) == 0 || len(op.Renewals) > maxOperationBatch {
+			return fmt.Errorf("RenewSteps must contain 1-%d renewals", maxOperationBatch)
 		}
-		fsm.steps.Store(op.StepID, step)
-		return RenewVerdict{Renewed: true}
+		verdicts := make([]RenewVerdict, len(op.Renewals))
+		for i, renewal := range op.Renewals {
+			verdicts[i] = fsm.renewStep(renewal)
+		}
+		return verdicts
 
 	case OpCommitResult:
 		var op CommitResultOp
 		if err := json.Unmarshal(p.Data, &op); err != nil {
 			return fmt.Errorf("invalid CommitResult data: %w", err)
 		}
-		v, found := fsm.steps.Load(op.StepID)
-		if !found {
-			return CommitVerdict{Reason: "unknown step"}
-		}
-		step := v.(Step)
-		if step.State == StateDone {
-			return CommitVerdict{Reason: "duplicate"}
-		}
-		if !step.commit(op.WorkerID, op.Attempt, op.Result) {
-			return CommitVerdict{Reason: "fenced"} // a zombie's late result
-		}
-		// The successor ID is part of the atomic result. Reject a collision
-		// before storing this mutated copy of the current step.
-		if op.Next != nil {
-			if _, exists := fsm.steps.Load(op.Next.StepID); exists {
-				return CommitVerdict{Reason: "next step exists"}
-			}
-		}
-		fsm.steps.Store(op.StepID, step)
-		fsm.work.removeOwned(op.WorkerID, op.StepID)
+		return fsm.commitResult(op)
 
-		// ATOMIC with the commit: the successor enters the ledger in this same
-		// Apply, so no crash can strand a turn between "done" and "chained".
-		if op.Next != nil {
-			fsm.insertStep(op.Next.StepID, op.Next.Session, op.Next.Kind, op.Next.Spec, step.Requirements)
+	case OpCommitResults:
+		var op CommitResultsOp
+		if err := json.Unmarshal(p.Data, &op); err != nil {
+			return fmt.Errorf("invalid CommitResults data: %w", err)
 		}
-		return CommitVerdict{Committed: true}
+		if len(op.Commits) == 0 || len(op.Commits) > maxOperationBatch {
+			return fmt.Errorf("CommitResults must contain 1-%d commits", maxOperationBatch)
+		}
+		verdicts := make([]CommitVerdict, len(op.Commits))
+		for i, commit := range op.Commits {
+			verdicts[i] = fsm.commitResult(commit)
+		}
+		return verdicts
 
 	case OpSetNode:
 		var op SetNodeOp

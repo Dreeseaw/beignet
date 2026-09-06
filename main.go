@@ -140,9 +140,13 @@ func main() {
 	http.HandleFunc("GET /v1/status", srv.statusHandler)
 
 	http.HandleFunc("POST /v1/step", srv.stepHandler)
+	http.HandleFunc("POST /v1/steps", srv.stepBatchHandler)
 	http.HandleFunc("POST /v1/work/claim", srv.workClaimHandler)
+	http.HandleFunc("POST /v1/work/claim-batch", srv.workClaimBatchHandler)
 	http.HandleFunc("POST /v1/work/renew", srv.workRenewHandler)
+	http.HandleFunc("POST /v1/work/renew-batch", srv.workRenewBatchHandler)
 	http.HandleFunc("POST /v1/work/commit", srv.workCommitHandler)
+	http.HandleFunc("POST /v1/work/commit-batch", srv.workCommitBatchHandler)
 
 	// Blob storage interface
 	http.HandleFunc("GET /v1/blob/{hash}", srv.hashGetHandler)
@@ -150,6 +154,7 @@ func main() {
 	http.HandleFunc("POST /v1/blobs/missing", srv.hashMissingHandler)
 
 	// Session watch interface
+	http.HandleFunc("GET /v1/session/{session}/summary", srv.sessionSummaryHandler)
 	http.HandleFunc("GET /v1/session/{session}/steps", srv.sessionStepsHandler)
 
 	// Node-to-node: followers forward writes here
