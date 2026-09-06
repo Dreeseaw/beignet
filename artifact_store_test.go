@@ -132,6 +132,7 @@ func TestS3ArtifactStoreClassifiesOnlyMissingKeysAsNotFound(t *testing.T) {
 		wantNotFound bool
 	}{
 		{code: "NoSuchKey", wantNotFound: true},
+		{code: "NotFound", wantNotFound: true},
 		{code: "NoSuchBucket", wantNotFound: false},
 	} {
 		t.Run(test.code, func(t *testing.T) {
