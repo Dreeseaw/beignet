@@ -172,6 +172,11 @@ const server = http.createServer(async (req, res) => {
 				res.end(JSON.stringify({ committed: false, reason: "fenced" }));
 				return;
 			}
+			if (next && steps.has(next.step_id)) {
+				res.writeHead(409, { "content-type": "application/json" });
+				res.end(JSON.stringify({ committed: false, reason: "next step exists" }));
+				return;
+			}
 			commit(step, result, next);
 			res.writeHead(200, { "content-type": "application/json" });
 			res.end(JSON.stringify({ committed: true }));
